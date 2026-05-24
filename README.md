@@ -2,12 +2,11 @@
 
 **Cuts your Claude bill 5-7x.** Smart model thinks, cheap model writes. Measured on real tasks, no quality loss on spec-driven work.
 
-```
-spend per 100 medium coding tasks       without maestrode    with maestrode
-  Claude Opus 4.7 brain                       ~$45                ~$6
-  Claude Sonnet 4.6 brain                     ~$27                ~$5
-  Claude Haiku 4.5 brain                      ~$9                 ~$4
-```
+| spend per 100 medium coding tasks | without maestrode | with maestrode |
+|---|---|---|
+| Claude Opus 4.7 brain | ~$45 | ~$6 |
+| Claude Sonnet 4.6 brain | ~$27 | ~$5 |
+| Claude Haiku 4.5 brain | ~$9 | ~$4 |
 
 Claude (or any expensive frontier model) plans, reads, decides, reviews, iterates. DeepSeek V4 Flash (or any OpenAI-compatible cheap model) writes the actual file contents. A 300-line bash shim handles delegation, structured failure feedback, multi-turn sessions, multi-file output, and KV-cache reuse.
 
