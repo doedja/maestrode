@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# maestrode: shim that lets a smart model orchestrate a cheap one for code work.
+#
+# Reads from any OpenAI-compatible Chat Completions endpoint. Defaults are
+# tuned for DeepSeek V4 Flash, but it works against OpenRouter, OmniRoute,
+# OpenCode Zen, ollama, lmstudio, or the official DeepSeek API.
+#
+# usage:
+#   maestrode "prompt"
+#   echo "context" | maestrode "task"
+#   maestrode -f a.py -f b.py "refactor both"
+#   maestrode --files out/ "spec... write files as <<<FILE: path >>> ... <<<END FILE>>> blocks"
+#   maestrode --session arm-b --system "You are a senior engineer." "follow-up turn"
+#   maestrode --full "include reasoning trace"
+#   maestrode --model gpt-5.1-codex "swap model"
+#
+# flags:
+#   --session NAME    persist multi-turn at ~/.config/maestrode/sessions/NAME.json
+#   --system TEXT     system prompt
+#   --files DIR       parse <<<FILE: path >>> ... <<<END FILE>>> blocks, write each under DIR
+#   -f|--file PATH    attach file contents as user context (repeatable)
+#   --model ID        override MAESTRODE_MODEL
+#   --max-tokens N    override max_tokens
+#   --reasoning-effort LEVEL   low|medium|high|max (provider-dependent)
+#   --thinking-budget N        enables thinking with budget_tokens=N
+#   --full            also print reasoning_content
+#   --raw             skip auto fence/dash sanitization
+#   --dry-run         print payload size estimate, no API call
+#   --warmup          send a small priming call first to crystallize KV-cache prefix
+#                     (use on a fresh --session before the first real call)
+#
+# env (from ~/.config/maestrode/env or shell):
+#   MAESTRODE_API_KEY        required
+#   MAESTRODE_MODEL          default: deepseek-v4-flash
+#   MAESTRODE_MAX_TOKENS     default: 32768
+#   MAESTRODE_ENDPOINT       default: https://api.deepseek.com/v1/chat/completions
+#   MAESTRODE_CURL_TIMEOUT   default: 300 (seconds)
+#   MAESTRODE_ALLOW_SECRETS  set to 1 to bypass the secret-pattern scan
+#
+# exit codes:
+#   0 ok, 1 transport error, 2 api error, 3 rate limit (429),
+#   4 --files parse: no blocks found, 64 usage, 65 secrets detected,
+#   66 file not found
+
+set -euo pipefail
+
+CONFIG_DIR="${MAESTRODE_CONFIG_DIR:-${HOME}/.config/maestrode}"
+ENV_FILE="${CONFIG_DIR}/env"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+: "${MAESTRODE_API_KEY:?set MAESTRODE_API_KEY in ${ENV_FILE} or env}"
+MODEL="${MAESTRODE_MODEL:-deepseek-v4-flash}"
+ENDPOINT="${MAESTRODE_ENDPOINT:-https://api.deepseek.com/v1/chat/completions}"
+MAX_TOKENS="${MAESTRODE_MAX_TOKENS:-32768}"
+
+FULL=0
+RAW=0
+DRY_RUN=0
+WARMUP=0
+FILES_DIR=""
+SESSION=""
+SYSTEM=""
+REASONING_EFFORT=""
+THINKING_BUDGET=""
+USER_FILES=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --full)        FULL=1; shift ;;
+    --raw)         RAW=1; shift ;;
+    --dry-run)     DRY_RUN=1; shift ;;
+    --warmup)      WARMUP=1; shift ;;
+    --reasoning-effort) REASONING_EFFORT="$2"; shift 2 ;;
+    --thinking-budget)  THINKING_BUDGET="$2"; shift 2 ;;
+    --model)       MODEL="$2"; shift 2 ;;
+    --max-tokens)  MAX_TOKENS="$2"; shift 2 ;;
+    --files)       FILES_DIR="$2"; shift 2 ;;
+    --session)     SESSION="$2"; shift 2 ;;
+    --system)      SYSTEM="$2"; shift 2 ;;
+    -f|--file)     USER_FILES+=("$2"); shift 2 ;;
+    -h|--help)
+      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    --) shift; break ;;
+    -*) echo "maestrode: unknown flag $1" >&2; exit 64 ;;
+    *)  break ;;
+  esac
+done
+
+TASK="${1:-}"
+
+PROMPT_FILE=$(mktemp -t maestrode_prompt.XXXXXX)
+PAYLOAD_FILE=$(mktemp -t maestrode_payload.XXXXXX)
+RESP_FILE=$(mktemp -t maestrode_resp.XXXXXX)
+trap 'rm -f "$PROMPT_FILE" "$PAYLOAD_FILE" "$RESP_FILE"' EXIT
+
+{
+  if [[ ! -t 0 ]]; then
+    cat
+    printf '\n\n'
+  fi
+  [[ -n "$TASK" ]] && printf '%s\n' "$TASK"
+  if [[ ${#USER_FILES[@]} -gt 0 ]]; then
+    for f in "${USER_FILES[@]}"; do
+      if [[ ! -f "$f" ]]; then
+        echo "maestrode: file not found: $f" >&2
+        exit 66
+      fi
+      printf '\n<<<FILE: %s>>>\n' "$f"
+      cat "$f"
+      printf '\n<<<END FILE>>>\n'
+    done
+  fi
+} > "$PROMPT_FILE"
+
+if [[ ! -s "$PROMPT_FILE" ]] || [[ -z "$(tr -d '[:space:]' < "$PROMPT_FILE")" ]]; then
+  echo "maestrode: empty prompt" >&2
+  exit 64
+fi
+
+if [[ "${MAESTRODE_ALLOW_SECRETS:-0}" != "1" ]]; then
+  SECRET_HITS=$(python3 - "$PROMPT_FILE" <<'PY'
+import re, sys, pathlib
+patterns = [
+    (r'\bsk-[A-Za-z0-9_-]{20,}', 'API key (sk-...)'),
+    (r'\bAKIA[0-9A-Z]{16}\b', 'AWS access key id'),
+    (r'\bASIA[0-9A-Z]{16}\b', 'AWS STS key'),
+    (r'\bxoxb-[A-Za-z0-9-]{10,}', 'Slack bot token'),
+    (r'\bghp_[A-Za-z0-9]{20,}', 'GitHub PAT'),
+    (r'\bgithub_pat_[A-Za-z0-9_]{20,}', 'GitHub fine-grained PAT'),
+    (r'-----BEGIN [A-Z ]*PRIVATE KEY-----', 'Private key'),
+    (r'\bAIza[0-9A-Za-z_-]{30,}', 'Google API key'),
+]
+text = pathlib.Path(sys.argv[1]).read_text()
+for pat, label in patterns:
+    m = re.search(pat, text)
+    if m:
+        snip = m.group(0)
+        snip = snip[:8] + '...' + snip[-4:] if len(snip) > 16 else snip
+        print(f"{label}: {snip}")
+PY
+)
+  if [[ -n "$SECRET_HITS" ]]; then
+    echo "maestrode: refusing to send prompt that looks like it contains secrets:" >&2
+    echo "$SECRET_HITS" >&2
+    echo "(set MAESTRODE_ALLOW_SECRETS=1 to override)" >&2
+    exit 65
+  fi
+fi
+
+SESSION_DIR="${CONFIG_DIR}/sessions"
+SESSION_FILE=""
+if [[ -n "$SESSION" ]]; then
+  mkdir -p "$SESSION_DIR"
+  SESSION_FILE="$SESSION_DIR/${SESSION}.json"
+fi
+
+MODEL="$MODEL" MAX_TOKENS="$MAX_TOKENS" SYSTEM="$SYSTEM" \
+SESSION_FILE="$SESSION_FILE" \
+REASONING_EFFORT="$REASONING_EFFORT" THINKING_BUDGET="$THINKING_BUDGET" \
+python3 - "$PROMPT_FILE" "$PAYLOAD_FILE" <<'PY'
+import json, os, sys
+user_msg = open(sys.argv[1]).read()
+messages = []
+session_file = os.environ.get("SESSION_FILE") or ""
+if session_file and os.path.exists(session_file):
+    messages = json.load(open(session_file))
+sysmsg = os.environ.get("SYSTEM") or ""
+if sysmsg:
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = sysmsg
+    else:
+        messages.insert(0, {"role": "system", "content": sysmsg})
+messages.append({"role": "user", "content": user_msg})
+payload = {
+    "model": os.environ["MODEL"],
+    "max_tokens": int(os.environ["MAX_TOKENS"]),
+    "messages": messages,
+}
+re_effort = os.environ.get("REASONING_EFFORT") or ""
+if re_effort:
+    payload["reasoning_effort"] = re_effort
+tb = os.environ.get("THINKING_BUDGET") or ""
+if tb:
+    payload["thinking"] = {"type": "enabled", "budget_tokens": int(tb)}
+open(sys.argv[2], "w").write(json.dumps(payload))
+PY
+
+if [[ "$WARMUP" == "1" ]]; then
+  WARMUP_PAYLOAD=$(mktemp -t maestrode_warm.XXXXXX)
+  WARMUP_RESP=$(mktemp -t maestrode_warm_resp.XXXXXX)
+  trap 'rm -f "$WARMUP_PAYLOAD" "$WARMUP_RESP" "$PROMPT_FILE" "$PAYLOAD_FILE" "$RESP_FILE"' EXIT
+  python3 - "$PAYLOAD_FILE" "$WARMUP_PAYLOAD" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+warmup_msgs = list(p["messages"])
+if warmup_msgs and warmup_msgs[-1].get("role") == "user":
+    warmup_msgs[-1] = {"role":"user","content":"ack"}
+p["messages"] = warmup_msgs
+p["max_tokens"] = 32
+json.dump(p, open(sys.argv[2], "w"))
+PY
+  curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-300}" \
+    -o "$WARMUP_RESP" -X POST "$ENDPOINT" \
+    -H "Authorization: Bearer ${MAESTRODE_API_KEY}" \
+    -H "Content-Type: application/json" \
+    --data-binary "@$WARMUP_PAYLOAD" >/dev/null 2>&1 || true
+  sys_cached=$(python3 -c "
+import json, sys
+try:
+  d = json.load(open(sys.argv[1]))
+  u = d.get('usage') or {}
+  print(u.get('prompt_cache_hit_tokens', 0), u.get('prompt_tokens', 0))
+except Exception:
+  print(0, 0)
+" "$WARMUP_RESP" 2>/dev/null) || sys_cached="0 0"
+  echo "[maestrode warmup: prompt=${sys_cached##* } cache=${sys_cached%% *}]" >&2
+fi
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  python3 - "$PAYLOAD_FILE" <<'PY'
+import json, sys, os
+p = json.load(open(sys.argv[1]))
+total_chars = 0
+for m in p["messages"]:
+    sys.stderr.write(f"[{m['role']}] {len(m['content'])} chars\n")
+    total_chars += len(m["content"])
+approx_tokens = total_chars // 4
+sys.stderr.write(f"[total] {total_chars} chars, ~{approx_tokens} tokens, max_tokens={p['max_tokens']}, model={p['model']}\n")
+sys.stderr.write(f"[dry-run] no request sent\n")
+PY
+  exit 0
+fi
+
+MAX_RETRIES="${MAESTRODE_MAX_RETRIES:-3}"
+if [[ "${MAESTRODE_NO_RETRY:-0}" == "1" ]]; then
+  MAX_RETRIES=0
+fi
+
+attempt=0
+backoff=2
+HTTP_CODE=""
+while true; do
+  HTTP_CODE=$(curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-300}" \
+    -o "$RESP_FILE" -w '%{http_code}' \
+    -X POST "$ENDPOINT" \
+    -H "Authorization: Bearer ${MAESTRODE_API_KEY}" \
+    -H "Content-Type: application/json" \
+    --data-binary "@$PAYLOAD_FILE") || {
+      echo "maestrode: curl failed" >&2
+      [[ -s "$RESP_FILE" ]] && cat "$RESP_FILE" >&2
+      exit 1
+    }
+  if [[ "$HTTP_CODE" == "429" || "$HTTP_CODE" == "503" || "$HTTP_CODE" == "502" ]]; then
+    if [[ $attempt -ge $MAX_RETRIES ]]; then
+      echo "maestrode: $HTTP_CODE after $MAX_RETRIES retries" >&2
+      cat "$RESP_FILE" >&2; echo >&2
+      [[ "$HTTP_CODE" == "429" ]] && exit 3 || exit 2
+    fi
+    jitter=$(( RANDOM % 1000 ))
+    sleep_s=$(python3 -c "print($backoff + $jitter/1000)" 2>/dev/null || echo "$backoff")
+    echo "maestrode: $HTTP_CODE, retry $((attempt+1))/$MAX_RETRIES after ${sleep_s}s" >&2
+    sleep "$sleep_s"
+    attempt=$((attempt+1))
+    backoff=$((backoff*2))
+    continue
+  fi
+  break
+done
+
+if [[ "$HTTP_CODE" != "200" ]]; then
+  echo "maestrode: http $HTTP_CODE" >&2
+  cat "$RESP_FILE" >&2; echo >&2
+  exit 2
+fi
+
+FULL="$FULL" RAW="$RAW" FILES_DIR="$FILES_DIR" \
+PROMPT_FILE="$PROMPT_FILE" SESSION_FILE="$SESSION_FILE" \
+python3 - "$RESP_FILE" <<'PY'
+import json, os, sys, re, pathlib
+
+resp = json.load(open(sys.argv[1]))
+if "error" in resp:
+    sys.stderr.write(f"maestrode api err: {json.dumps(resp['error'])}\n")
+    sys.exit(2)
+try:
+    m = resp["choices"][0]["message"]
+except (KeyError, IndexError):
+    sys.stderr.write(f"maestrode: unexpected response shape\n")
+    sys.exit(2)
+
+content = m.get("content") or ""
+reasoning = m.get("reasoning_content") or ""
+
+if os.environ.get("RAW") != "1":
+    c = content.strip()
+    c = re.sub(r'^```[a-zA-Z0-9_+\-]*\s*\n', '', c)
+    c = re.sub(r'\n```\s*$', '', c)
+    c = c.replace(chr(0x2014), '-').replace(chr(0x2013), '-')
+    content = c
+
+session_file = os.environ.get("SESSION_FILE") or ""
+if session_file:
+    user_msg = open(os.environ["PROMPT_FILE"]).read()
+    messages = []
+    if os.path.exists(session_file):
+        messages = json.load(open(session_file))
+    if not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != user_msg:
+        messages.append({"role": "user", "content": user_msg})
+    messages.append({"role": "assistant", "content": content})
+    pathlib.Path(session_file).parent.mkdir(parents=True, exist_ok=True)
+    open(session_file, "w").write(json.dumps(messages, indent=2))
+
+files_written = []
+files_dir = os.environ.get("FILES_DIR") or ""
+if files_dir:
+    pat = re.compile(
+        r'<<<\s*FILE:\s*(?P<path>[^\n>]+?)\s*>>>\s*\n(?P<body>.*?)\s*<<<\s*END\s*(?:FILE)?\s*>>>',
+        re.DOTALL,
+    )
+    base = pathlib.Path(files_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    for mm in pat.finditer(content):
+        rel = mm.group("path").strip().lstrip("/")
+        parts = pathlib.PurePosixPath(rel).parts
+        if ".." in parts or any(p.startswith("/") for p in parts):
+            sys.stderr.write(f"maestrode: refused unsafe path {rel}\n")
+            continue
+        body = mm.group("body")
+        body = re.sub(r'^```[a-zA-Z0-9_+\-]*\s*\n', '', body)
+        body = re.sub(r'\n```\s*$', '', body)
+        target = base / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not body.endswith("\n"):
+            body += "\n"
+        target.write_text(body)
+        files_written.append(str(target))
+    if not files_written:
+        sys.stderr.write("maestrode: --files set but no <<<FILE: ... >>> blocks found\n")
+        sys.exit(4)
+
+if os.environ.get("FULL") == "1" and reasoning:
+    sys.stdout.write("----- reasoning -----\n")
+    sys.stdout.write(reasoning.rstrip() + "\n")
+    sys.stdout.write("----- end reasoning -----\n\n")
+sys.stdout.write(content.rstrip() + "\n")
+
+u = resp.get("usage") or {}
+ct = u.get("completion_tokens") or 0
+rt = (u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+pt = u.get("prompt_tokens")
+out_t = ct - rt if isinstance(ct, int) else "?"
+hit = u.get("prompt_cache_hit_tokens", 0)
+miss = u.get("prompt_cache_miss_tokens", 0)
+cache_str = ""
+if (hit or miss) and pt:
+    hit_pct = round(100 * (hit or 0) / pt) if pt else 0
+    cache_str = f" cache={hit}/{pt}({hit_pct}%)"
+sys.stderr.write(f"[maestrode model={resp.get('model')} prompt={pt} reason={rt} out={out_t}{cache_str}]\n")
+if files_written:
+    sys.stderr.write(f"[maestrode wrote {len(files_written)} files to {files_dir}]\n")
+    for f in files_written:
+        sys.stderr.write(f"  + {f}\n")
+PY
