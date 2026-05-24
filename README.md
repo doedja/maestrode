@@ -1,11 +1,13 @@
 # maestrode
 
-**Cuts your Claude bill 5-7x.** Smart model thinks, cheap model writes. Measured on real tasks, no quality loss on spec-driven work.
+**Cuts your Claude usage by ~80%.** Smart model thinks, cheap model writes. Measured on real tasks, no quality loss on spec-driven work.
 
-| spend per 100 medium coding tasks | without maestrode | with maestrode |
+| your brain | Claude tokens per task | Claude usage cut |
 |---|---|---|
-| Claude Opus 4.7 brain | ~$45 | ~$6 |
-| Claude Sonnet 4.7 brain | ~$27 | ~$5 |
+| Claude Opus 4.7 | ~30k → ~4k | **~87%** |
+| Claude Sonnet 4.7 | ~30k → ~5k | **~83%** |
+
+If you're on a subscription tier, this means more work fits inside the same quota (or you drop a tier and stop paying for headroom you don't need). If you're on API billing, the same percentage shows up as a smaller invoice.
 
 Claude (or any expensive frontier model) plans, reads, decides, reviews, iterates. DeepSeek V4 Flash (or any OpenAI-compatible cheap model) writes the actual file contents. A 300-line bash shim handles delegation, structured failure feedback, multi-turn sessions, multi-file output, and KV-cache reuse.
 
