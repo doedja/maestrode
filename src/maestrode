@@ -29,18 +29,28 @@
 #   --warmup          send a small priming call first to crystallize KV-cache prefix
 #                     (use on a fresh --session before the first real call)
 #
+# escalation contract (NEEDS_SMART):
+#   the muscle can self-report when a brief is too vague or a task exceeds
+#   its capability by emitting `<<<NEEDS_SMART>>>` or `<<<NEEDS_SMART: reason>>>`
+#   as the first non-empty line of its response. maestrode exits 5 and prints
+#   the rationale to stderr. session log + --files writes are skipped so the
+#   brain can rerun the turn directly without polluting state.
+#   teach the muscle about this contract via --system, e.g.:
+#     --system "if the brief is ambiguous or the task exceeds your capability,
+#               emit <<<NEEDS_SMART: short reason>>> as line 1 and stop."
+#
 # env (from ~/.config/maestrode/env or shell):
 #   MAESTRODE_API_KEY        required
 #   MAESTRODE_MODEL          default: deepseek-v4-flash
-#   MAESTRODE_MAX_TOKENS     default: 32768
+#   MAESTRODE_MAX_TOKENS     default: 65536 (raise if your endpoint allows more)
 #   MAESTRODE_ENDPOINT       default: https://api.deepseek.com/v1/chat/completions
-#   MAESTRODE_CURL_TIMEOUT   default: 300 (seconds)
+#   MAESTRODE_CURL_TIMEOUT   default: 600 (seconds)
 #   MAESTRODE_ALLOW_SECRETS  set to 1 to bypass the secret-pattern scan
 #
 # exit codes:
 #   0 ok, 1 transport error, 2 api error, 3 rate limit (429),
-#   4 --files parse: no blocks found, 64 usage, 65 secrets detected,
-#   66 file not found
+#   4 --files parse: no blocks found, 5 muscle escalated (NEEDS_SMART),
+#   64 usage, 65 secrets detected, 66 file not found
 
 set -euo pipefail
 
@@ -56,7 +66,7 @@ fi
 : "${MAESTRODE_API_KEY:?set MAESTRODE_API_KEY in ${ENV_FILE} or env}"
 MODEL="${MAESTRODE_MODEL:-deepseek-v4-flash}"
 ENDPOINT="${MAESTRODE_ENDPOINT:-https://api.deepseek.com/v1/chat/completions}"
-MAX_TOKENS="${MAESTRODE_MAX_TOKENS:-32768}"
+MAX_TOKENS="${MAESTRODE_MAX_TOKENS:-65536}"
 
 FULL=0
 RAW=0
@@ -205,7 +215,7 @@ p["messages"] = warmup_msgs
 p["max_tokens"] = 32
 json.dump(p, open(sys.argv[2], "w"))
 PY
-  curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-300}" \
+  curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-600}" \
     -o "$WARMUP_RESP" -X POST "$ENDPOINT" \
     -H "Authorization: Bearer ${MAESTRODE_API_KEY}" \
     -H "Content-Type: application/json" \
@@ -246,7 +256,7 @@ attempt=0
 backoff=2
 HTTP_CODE=""
 while true; do
-  HTTP_CODE=$(curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-300}" \
+  HTTP_CODE=$(curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-600}" \
     -o "$RESP_FILE" -w '%{http_code}' \
     -X POST "$ENDPOINT" \
     -H "Authorization: Bearer ${MAESTRODE_API_KEY}" \
@@ -289,13 +299,33 @@ if "error" in resp:
     sys.stderr.write(f"maestrode api err: {json.dumps(resp['error'])}\n")
     sys.exit(2)
 try:
-    m = resp["choices"][0]["message"]
+    choice = resp["choices"][0]
+    m = choice["message"]
 except (KeyError, IndexError):
     sys.stderr.write(f"maestrode: unexpected response shape\n")
     sys.exit(2)
 
 content = m.get("content") or ""
 reasoning = m.get("reasoning_content") or ""
+finish = choice.get("finish_reason") or ""
+
+# Self-report escalation: if the muscle decides the task exceeds its capability
+# or the brief is too ambiguous, it emits <<<NEEDS_SMART>>> (optionally with a
+# rationale) as the FIRST non-empty line. Exit 5 so the brain can fall back to
+# direct authoring. Checked before session write and --files parse so a clean
+# session is preserved and no partial files are written.
+first_line = ""
+for ln in content.lstrip().splitlines():
+    s = ln.strip()
+    if s:
+        first_line = s
+        break
+esc = re.match(r'<<<\s*NEEDS_SMART\s*(?::\s*(.*?))?\s*>>>\s*$', first_line)
+if esc:
+    why = (esc.group(1) or "").strip() or "(no reason given)"
+    sys.stderr.write(f"maestrode: muscle escalated. reason: {why}\n")
+    sys.stderr.write("hint: handle this turn with the smart model directly.\n")
+    sys.exit(5)
 
 if os.environ.get("RAW") != "1":
     c = content.strip()
@@ -325,7 +355,8 @@ if files_dir:
     )
     base = pathlib.Path(files_dir)
     base.mkdir(parents=True, exist_ok=True)
-    for mm in pat.finditer(content):
+    matches = list(pat.finditer(content))
+    for mm in matches:
         rel = mm.group("path").strip().lstrip("/")
         parts = pathlib.PurePosixPath(rel).parts
         if ".." in parts or any(p.startswith("/") for p in parts):
@@ -340,6 +371,16 @@ if files_dir:
             body += "\n"
         target.write_text(body)
         files_written.append(str(target))
+    # Truncation diagnostic: count open markers vs successful (open+close) pairs.
+    # finditer only matches closed blocks, so any excess opens were cut off.
+    opened = len(re.findall(r'<<<\s*FILE:', content))
+    unclosed = opened - len(matches)
+    if unclosed > 0:
+        sys.stderr.write(
+            f"maestrode: {unclosed} <<<FILE:>>> block(s) opened but not closed. "
+            f"response looks truncated; retry with --max-tokens higher "
+            f"or split the task.\n"
+        )
     if not files_written:
         sys.stderr.write("maestrode: --files set but no <<<FILE: ... >>> blocks found\n")
         sys.exit(4)
@@ -361,7 +402,10 @@ cache_str = ""
 if (hit or miss) and pt:
     hit_pct = round(100 * (hit or 0) / pt) if pt else 0
     cache_str = f" cache={hit}/{pt}({hit_pct}%)"
-sys.stderr.write(f"[maestrode model={resp.get('model')} prompt={pt} reason={rt} out={out_t}{cache_str}]\n")
+finish_str = f" finish={finish}" if finish and finish != "stop" else ""
+sys.stderr.write(f"[maestrode model={resp.get('model')} prompt={pt} reason={rt} out={out_t}{cache_str}{finish_str}]\n")
+if finish == "length":
+    sys.stderr.write("maestrode: response cut by max_tokens. raise --max-tokens (or MAESTRODE_MAX_TOKENS).\n")
 if files_written:
     sys.stderr.write(f"[maestrode wrote {len(files_written)} files to {files_dir}]\n")
     for f in files_written:

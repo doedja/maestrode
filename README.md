@@ -13,17 +13,11 @@ Claude (or any expensive frontier model) plans, reads, decides, reviews, iterate
 
 ## Why I built this
 
-I was on Claude Max 5x and kept brushing against the quota. Bumped up to Max 20x but never actually hit the ceiling there. The price gap felt steep for headroom I wasn't using. So I experimented.
+I was on Claude Max 20x but never hit the ceiling. The price felt steep for headroom I wasn't using.
 
-Hypothesis: most of what Claude does turn-by-turn is writing code, not thinking about what code to write. The thinking part is what frontier models are uniquely good at. The writing part is interchangeable.
+Claude does two jobs per turn: thinking and writing. Thinking is what frontier models are uniquely good at. Writing is interchangeable. So I wired Claude as the brain and DeepSeek V4 Flash as the muscle, benchmarked it 10 ways, and confirmed quality holds on spec-driven work. Where flash falls down, the brief was sloppy, not the model. Back on the smaller tier now, the muscle calls are basically free.
 
-Wired up Claude as the brain (still reads, plans, reviews, runs tests) and DeepSeek V4 Flash as the muscle (writes the actual file contents). Then I benchmarked it 10 ways to make sure quality held up. It does.
-
-Honestly the hypothesis held up better than I expected. Flash isn't worse at writing code, it just needs the brain to hand it a clearer brief. On clean spec-driven tasks (the surgical edit, the Go bugfix, the multi-file FastAPI build), flash and Opus produced near-identical code. The differences were stylistic, `Optional[str]` vs `str | None`, explicit alias vs convention. Both pass the same tests, both pass mypy strict, both ship.
-
-Where flash falls down is exactly where the brief is sloppy. The tricky-rules test, flash got the case-sensitive scheme bug wrong because the spec didn't emphasize case. The vague brief test, flash hallucinated a bug that wasn't even there. Both cases, a structured FAIL/SUSPECT/FIX follow-up fixed it in one round. Takeaway: don't blame the cheap model. Tighten the brief first.
-
-Back on the smaller tier now, the muscle calls are basically free. This repo is the wrapper + skill that made it work, plus the measurements.
+This repo is the wrapper + skill that made it work, plus the measurements.
 
 ## Quickstart
 
@@ -113,6 +107,32 @@ Set `MAESTRODE_API_KEY` and `MAESTRODE_ENDPOINT` in `~/.config/maestrode/env`.
 ## Pairs well with
 
 [rtk](https://www.rtk-ai.app/) (`brew install rtk`): rewrites your `ls`, `git`, `gh`, `tree`, `read` commands into token-compact output. Different layer than maestrode. Stacks cleanly. Not affiliated.
+
+## Big jobs
+
+For multi-module builds, split the brief and dispatch in parallel:
+
+```bash
+maestrode --session p-api --files build/api "<api brief>" &
+maestrode --session p-db  --files build/db  "<db brief>"  &
+maestrode --session p-web --files build/web "<web brief>" &
+wait
+```
+
+Each call has its own session (independent cache) and its own output dir. Three parallel ~30s calls finish in ~30s wall, not ~90s, and each stays under `max_tokens`. Defaults: `MAESTRODE_MAX_TOKENS=65536`, `MAESTRODE_CURL_TIMEOUT=600`. Raise both via env if your endpoint supports more.
+
+## Feedback the shim gives you
+
+- **`finish=length`** in the stderr stat line plus `response cut by max_tokens` warning when the model hit the cap. Raise `--max-tokens` (or split the brief).
+- **`N <<<FILE:>>> block(s) opened but not closed`** when `--files` parsing finds a truncated response. Closed blocks still get written; reissue the missing ones.
+- **Exit 5 (`NEEDS_SMART`)** when the cheap muscle decides the brief is too thin or the task exceeds its capability. Session + file writes are skipped. The brain takes over.
+
+Teach the muscle the escalation contract via `--system`:
+
+```text
+If the brief is ambiguous, missing key details, or beyond your capability,
+emit `<<<NEEDS_SMART: <one-line reason>>>>` as the very first line and stop.
+```
 
 ## Caveats
 

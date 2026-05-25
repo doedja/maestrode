@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+Feedback-loop improvements (lessons borrowed from Reasonix's Pillar 3):
+
+- **`<<<NEEDS_SMART>>>` self-escalation.** The muscle can refuse a brief
+  it judges too vague or beyond its capability by emitting
+  `<<<NEEDS_SMART>>>` (optionally `<<<NEEDS_SMART: reason>>>`) as the
+  first non-empty line. Shim exits **5**, prints the rationale, and skips
+  session + `--files` writes so state stays clean. Pair with a `--system`
+  prompt that teaches the contract.
+- **Truncation diagnostic.** Detects `finish_reason=length` and unbalanced
+  `<<<FILE:>>>` blocks; surfaces clear warnings to stderr. Closed blocks
+  still get written so partial progress is recoverable.
+- **Higher defaults.** `MAESTRODE_MAX_TOKENS` 32768 → 65536,
+  `MAESTRODE_CURL_TIMEOUT` 300 → 600.
+- **Parallel-dispatch pattern** documented in skill + README for
+  multi-module builds (shell `&` + `wait` with per-session, per-output-dir
+  calls).
+
+Install:
+
+- **Windows native installer (`install.ps1`).** Mirrors `install.sh`,
+  drops a `maestrode.cmd` shim so the command runs from cmd / PowerShell
+  / Windows Terminal without opening Git Bash. Requires Git for Windows
+  (`bash.exe`) and Python 3 at runtime.
+- **`--uninstall` flag** on both installers (`--keep-config` to preserve
+  the env file).
+
+13 new test cases (total 36, all passing, still no network).
+
 ## v0.1.0 (initial release)
 
 First public version. 10 benchmarks of measurement, 23 unit tests, runnable quickstart.

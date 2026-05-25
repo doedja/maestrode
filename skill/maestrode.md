@@ -138,6 +138,68 @@ For multi-file briefs add a "first emit a `<<<PLAN>>>` block, then file
 blocks" instruction. The muscle articulates intent before generating code.
 No measurable benefit on clear briefs; use when ambiguity is real.
 
+## Big jobs: split + parallelize, do not one-shot
+
+For multi-module builds (e.g. 8+ files across 3+ concerns), do not stuff
+everything into one brief. The muscle hits `max_tokens` partway through,
+the parser stops at the last closed `<<<END FILE>>>`, and the rest of the
+work is silently missing. The shim now surfaces this as a stderr line
+("response cut by max_tokens" + "N blocks opened but not closed") but
+the fix is upstream: split the brief.
+
+Pattern: one brief per concern, run in parallel with shell `&` + `wait`:
+
+```bash
+maestrode --session p-api --files build/api "<api-layer brief>" &
+maestrode --session p-db  --files build/db  "<db-layer brief>"  &
+maestrode --session p-web --files build/web "<web-layer brief>" &
+wait
+```
+
+Each call has its own session (independent KV cache, no cross-contamination)
+and its own output dir. Three parallel ~30s calls finish in ~30s wall, not
+~90s; you also stay under each call's `max_tokens` budget. The brain then
+reviews and stitches as usual.
+
+Rule of thumb: if your brief asks for more than ~6 files OR more than ~15k
+output tokens, split it. Default `MAESTRODE_MAX_TOKENS=65536` covers most
+single-shot jobs, but timeouts grow with output size and big single-shot
+calls have a long tail.
+
+When the shim exits nonzero on one of the parallel calls, that batch's
+output dir tells you exactly which concern to retry. The rest already
+landed.
+
+## Self-escalation: `<<<NEEDS_SMART>>>`
+
+The muscle can refuse a brief it judges too vague or beyond its capability
+by emitting `<<<NEEDS_SMART>>>` (optionally with a one-line reason:
+`<<<NEEDS_SMART: brief omits the failing assertion text>>>`) as the FIRST
+non-empty line. The shim then:
+
+- Exits **5** (distinct from any other error code).
+- Prints the rationale to stderr.
+- Skips the session-log write and `--files` writes, so state stays clean.
+
+To enable this, pass a `--system` prompt that teaches the muscle the
+contract. Recommended boilerplate:
+
+```text
+If the brief is ambiguous, missing key details (failing test output,
+expected behavior, target file paths), or the task clearly exceeds
+your capability, emit `<<<NEEDS_SMART: <one-line reason>>>>` as the
+very first line of your response and stop. Do not attempt to guess.
+```
+
+Brain-side: on exit 5, do NOT retry with the muscle. Read the rationale,
+gather the missing context (run the failing test, read the suspect file,
+ask the user for clarification), then either re-brief the muscle with the
+gap closed or do the turn directly.
+
+This is the cheap-model equivalent of "I do not know" and is strictly
+better than hallucinated output: ~$0.001 to learn "this brief is too thin"
+versus ~$0.01 + a fix round to discover the muscle invented a function.
+
 ## Vague briefs: use smart model directly, not maestrode
 
 When the brain knows only "test X failed" without assertion text, got/

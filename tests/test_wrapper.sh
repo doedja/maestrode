@@ -145,6 +145,66 @@ PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --session sess1 "second message" >/dev/null 
 turn2=$(python3 -c "import json; print(len(json.load(open('$SESS_FILE'))))" 2>/dev/null)
 [[ "$turn2" == "4" ]] && ok "session has 4 entries after turn 2" || ko "session len wrong: $turn2"
 
+echo "== test 14: NEEDS_SMART bare marker exits 5 =="
+cat > "$FIXTURE" <<'JEOF'
+{"choices":[{"message":{"content":"<<<NEEDS_SMART>>>"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}
+JEOF
+set +e
+err=$(PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "task" 2>&1 >/dev/null)
+code=$?
+set -e
+[[ $code -eq 5 ]] && ok "exit 5 on NEEDS_SMART" || ko "wrong exit: $code"
+[[ "$err" == *"muscle escalated"* ]] && ok "escalation reason logged" || ko "no escalation log: $err"
+[[ "$err" == *"no reason given"* ]] && ok "bare marker shows placeholder reason" || ko "missing placeholder: $err"
+
+echo "== test 15: NEEDS_SMART with rationale =="
+cat > "$FIXTURE" <<'JEOF'
+{"choices":[{"message":{"content":"<<<NEEDS_SMART: brief lacks the failing assertion text>>>\n\nfollow up junk"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}
+JEOF
+set +e
+err=$(PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "task" 2>&1 >/dev/null)
+code=$?
+set -e
+[[ $code -eq 5 ]] && ok "exit 5 with rationale" || ko "wrong exit: $code"
+[[ "$err" == *"brief lacks the failing assertion text"* ]] && ok "rationale surfaced" || ko "rationale missing: $err"
+
+echo "== test 16: NEEDS_SMART does not write session or files =="
+cat > "$FIXTURE" <<'JEOF'
+{"choices":[{"message":{"content":"<<<NEEDS_SMART: too vague>>>"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}
+JEOF
+rm -rf "$OUTDIR"
+rm -f "$MAESTRODE_CONFIG_DIR/sessions/sess_esc.json"
+set +e
+PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --session sess_esc --files "$OUTDIR" "task" >/dev/null 2>&1
+set -e
+[[ ! -f "$MAESTRODE_CONFIG_DIR/sessions/sess_esc.json" ]] && ok "no session file written on escalation" || ko "session leaked on escalation"
+[[ ! -d "$OUTDIR" ]] || [[ -z "$(ls -A "$OUTDIR" 2>/dev/null)" ]] && ok "no files written on escalation" || ko "files leaked on escalation"
+
+echo "== test 17: finish_reason=length emits truncation warning =="
+cat > "$FIXTURE" <<'JEOF'
+{"choices":[{"message":{"content":"partial content here"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}
+JEOF
+set +e
+err=$(PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "task" 2>&1 >/dev/null)
+code=$?
+set -e
+[[ $code -eq 0 ]] && ok "still exits 0 (content delivered)" || ko "wrong exit: $code"
+[[ "$err" == *"cut by max_tokens"* ]] && ok "max_tokens warning surfaced" || ko "no truncation warning: $err"
+[[ "$err" == *"finish=length"* ]] && ok "finish_reason shown in stat line" || ko "finish missing: $err"
+
+echo "== test 18: unclosed <<<FILE:>>> blocks emit truncation diagnostic =="
+cat > "$FIXTURE" <<'JEOF'
+{"choices":[{"message":{"content":"<<<FILE: ok.py>>>\nclosed body\n<<<END FILE>>>\n\n<<<FILE: cut.py>>>\nbody that never closes"},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}
+JEOF
+rm -rf "$OUTDIR"
+set +e
+err=$(PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --files "$OUTDIR" "task" 2>&1 >/dev/null)
+code=$?
+set -e
+[[ -f "$OUTDIR/ok.py" ]] && ok "closed block still written" || ko "closed block missing"
+[[ ! -f "$OUTDIR/cut.py" ]] && ok "unclosed block not written" || ko "unclosed block leaked"
+[[ "$err" == *"opened but not closed"* ]] && ok "unclosed-block diagnostic surfaced" || ko "no unclosed diagnostic: $err"
+
 echo
 echo "==== $PASS passed, $FAIL failed ===="
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1
