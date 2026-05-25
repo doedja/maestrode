@@ -3,9 +3,13 @@
 #   2) from clone:  .\install.ps1   (uses the local src\maestrode file)
 # Idempotent: safe to re-run.
 #
+# Also drops the Claude Code skill at %USERPROFILE%\.claude\skills\maestrode\SKILL.md
+# when ~/.claude exists. Set $env:MAESTRODE_NO_SKILL=1 to skip, or
+# $env:MAESTRODE_SKILL_DIR=... to override.
+#
 # uninstall:
-#   .\install.ps1 -Uninstall                (remove binary + config + sessions)
-#   .\install.ps1 -Uninstall -KeepConfig    (remove binary only)
+#   .\install.ps1 -Uninstall                (remove binary + config + sessions + skill)
+#   .\install.ps1 -Uninstall -KeepConfig    (remove binary + skill only)
 #
 # requires:
 #   - Git for Windows (provides bash.exe). Install: winget install Git.Git
@@ -33,6 +37,8 @@ $Repo    = if ($env:MAESTRODE_REPO)    { $env:MAESTRODE_REPO }    else { 'doedja
 $Branch  = if ($env:MAESTRODE_BRANCH)  { $env:MAESTRODE_BRANCH }  else { 'main' }
 $InstallDir = if ($env:MAESTRODE_INSTALL_DIR) { $env:MAESTRODE_INSTALL_DIR } else { "$env:USERPROFILE\.local\bin" }
 $ConfigDir  = if ($env:MAESTRODE_CONFIG_DIR)  { $env:MAESTRODE_CONFIG_DIR }  else { "$env:USERPROFILE\.config\maestrode" }
+$SkillDir   = if ($env:MAESTRODE_SKILL_DIR)   { $env:MAESTRODE_SKILL_DIR }   else { "$env:USERPROFILE\.claude\skills\maestrode" }
+$ClaudeRoot = "$env:USERPROFILE\.claude"
 $RawBase = "https://raw.githubusercontent.com/$Repo/$Branch"
 
 function Remove-PathEntry {
@@ -63,6 +69,15 @@ if ($Uninstall) {
             Write-Host "removed $p"
             $removed = $true
         }
+    }
+    $skillFile = Join-Path $SkillDir 'SKILL.md'
+    if (Test-Path $skillFile) {
+        Remove-Item -Force $skillFile
+        if ((Test-Path $SkillDir) -and -not (Get-ChildItem -Force $SkillDir)) {
+            Remove-Item -Force $SkillDir
+        }
+        Write-Host "removed $skillFile"
+        $removed = $true
     }
     if (-not $KeepConfig -and (Test-Path $ConfigDir)) {
         Remove-Item -Recurse -Force $ConfigDir
@@ -128,6 +143,29 @@ if ($LocalSrc) {
         Remove-Item -Force $Target
         Write-Host "error: downloaded file does not look like a bash script" -ForegroundColor Red
         exit 1
+    }
+}
+
+# Claude Code skill sync. Default: install if ~/.claude exists.
+# Override: $env:MAESTRODE_NO_SKILL=1 to skip, $env:MAESTRODE_SKILL_DIR=... to relocate.
+if ($env:MAESTRODE_NO_SKILL -ne '1' -and ((Test-Path $ClaudeRoot) -or $env:MAESTRODE_SKILL_DIR)) {
+    $skillTarget = Join-Path $SkillDir 'SKILL.md'
+    New-Item -ItemType Directory -Force -Path $SkillDir | Out-Null
+    $localSkill = $null
+    if ($ScriptDir) {
+        $candidate = Join-Path $ScriptDir 'skill\maestrode.md'
+        if (Test-Path $candidate) { $localSkill = $candidate }
+    }
+    if ($localSkill) {
+        Copy-Item -Force $localSkill $skillTarget
+        Write-Host "synced skill from $localSkill -> $skillTarget"
+    } else {
+        try {
+            Invoke-WebRequest -Uri "$RawBase/skill/maestrode.md" -OutFile $skillTarget -UseBasicParsing
+            Write-Host "synced skill -> $skillTarget"
+        } catch {
+            Write-Warning "could not download skill from $RawBase/skill/maestrode.md: $_"
+        }
     }
 }
 

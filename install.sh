@@ -4,9 +4,13 @@
 #   2) from clone:  ./install.sh  (uses the local src/maestrode file)
 # Idempotent: safe to re-run.
 #
+# Also drops the Claude Code skill at ~/.claude/skills/maestrode/SKILL.md
+# when ~/.claude exists. Set MAESTRODE_NO_SKILL=1 to skip, or
+# MAESTRODE_SKILL_DIR=/path to override.
+#
 # uninstall:
-#   ./install.sh --uninstall            (remove binary + config + sessions)
-#   ./install.sh --uninstall --keep-config   (remove binary only)
+#   ./install.sh --uninstall            (remove binary + config + sessions + skill)
+#   ./install.sh --uninstall --keep-config   (remove binary + skill only)
 #   curl -fsSL .../install.sh | bash -s -- --uninstall
 
 set -euo pipefail
@@ -15,6 +19,7 @@ REPO="${MAESTRODE_REPO:-doedja/maestrode}"
 BRANCH="${MAESTRODE_BRANCH:-main}"
 INSTALL_DIR="${MAESTRODE_INSTALL_DIR:-${HOME}/.local/bin}"
 CONFIG_DIR="${MAESTRODE_CONFIG_DIR:-${HOME}/.config/maestrode}"
+SKILL_DIR="${MAESTRODE_SKILL_DIR:-${HOME}/.claude/skills/maestrode}"
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 
@@ -25,7 +30,7 @@ for arg in "$@"; do
     --uninstall)    ACTION="uninstall" ;;
     --keep-config)  KEEP_CONFIG=1 ;;
     -h|--help)
-      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "install.sh: unknown flag $arg" >&2; exit 64 ;;
   esac
@@ -37,6 +42,13 @@ if [[ "$ACTION" == "uninstall" ]]; then
   if [[ -e "$BIN" ]]; then
     rm -f "$BIN"
     echo "removed $BIN"
+    removed=1
+  fi
+  SKILL_FILE="$SKILL_DIR/SKILL.md"
+  if [[ -e "$SKILL_FILE" ]]; then
+    rm -f "$SKILL_FILE"
+    rmdir "$SKILL_DIR" 2>/dev/null || true
+    echo "removed $SKILL_FILE"
     removed=1
   fi
   if [[ $KEEP_CONFIG -eq 0 ]] && [[ -d "$CONFIG_DIR" ]]; then
@@ -88,6 +100,29 @@ else
 fi
 
 install -m 0755 "$SRC" "$INSTALL_DIR/maestrode"
+
+# Claude Code skill sync. Default: install if ~/.claude exists.
+# Override: MAESTRODE_NO_SKILL=1 to skip, MAESTRODE_SKILL_DIR=/path to relocate.
+if [[ "${MAESTRODE_NO_SKILL:-0}" != "1" ]] && [[ -d "${HOME}/.claude" || -n "${MAESTRODE_SKILL_DIR:-}" ]]; then
+  LOCAL_SKILL=""
+  if [[ -n "${SCRIPT_DIR:-}" ]] && [[ -f "${SCRIPT_DIR}/skill/maestrode.md" ]]; then
+    LOCAL_SKILL="${SCRIPT_DIR}/skill/maestrode.md"
+  fi
+  mkdir -p "$SKILL_DIR"
+  if [[ -n "$LOCAL_SKILL" ]]; then
+    install -m 0644 "$LOCAL_SKILL" "${SKILL_DIR}/SKILL.md"
+    echo "synced skill from ${LOCAL_SKILL} -> ${SKILL_DIR}/SKILL.md"
+  else
+    SKILL_TMP=$(mktemp)
+    if curl -fsSL "${RAW_BASE}/skill/maestrode.md" -o "$SKILL_TMP"; then
+      install -m 0644 "$SKILL_TMP" "${SKILL_DIR}/SKILL.md"
+      echo "synced skill -> ${SKILL_DIR}/SKILL.md"
+    else
+      echo "warn: could not download skill from ${RAW_BASE}/skill/maestrode.md" >&2
+    fi
+    rm -f "$SKILL_TMP"
+  fi
+fi
 
 ENV_FILE="${CONFIG_DIR}/env"
 if [[ ! -f "$ENV_FILE" ]]; then
