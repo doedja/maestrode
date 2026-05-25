@@ -3,6 +3,11 @@
 #   1) curl piped:  curl -fsSL https://raw.githubusercontent.com/<user>/maestrode/main/install.sh | bash
 #   2) from clone:  ./install.sh  (uses the local src/maestrode file)
 # Idempotent: safe to re-run.
+#
+# uninstall:
+#   ./install.sh --uninstall            (remove binary + config + sessions)
+#   ./install.sh --uninstall --keep-config   (remove binary only)
+#   curl -fsSL .../install.sh | bash -s -- --uninstall
 
 set -euo pipefail
 
@@ -12,6 +17,44 @@ INSTALL_DIR="${MAESTRODE_INSTALL_DIR:-${HOME}/.local/bin}"
 CONFIG_DIR="${MAESTRODE_CONFIG_DIR:-${HOME}/.config/maestrode}"
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+
+ACTION="install"
+KEEP_CONFIG=0
+for arg in "$@"; do
+  case "$arg" in
+    --uninstall)    ACTION="uninstall" ;;
+    --keep-config)  KEEP_CONFIG=1 ;;
+    -h|--help)
+      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "install.sh: unknown flag $arg" >&2; exit 64 ;;
+  esac
+done
+
+if [[ "$ACTION" == "uninstall" ]]; then
+  removed=0
+  BIN="$INSTALL_DIR/maestrode"
+  if [[ -e "$BIN" ]]; then
+    rm -f "$BIN"
+    echo "removed $BIN"
+    removed=1
+  fi
+  if [[ $KEEP_CONFIG -eq 0 ]] && [[ -d "$CONFIG_DIR" ]]; then
+    rm -rf "$CONFIG_DIR"
+    echo "removed $CONFIG_DIR"
+    removed=1
+  fi
+  if [[ $removed -eq 0 ]]; then
+    if [[ $KEEP_CONFIG -eq 1 ]]; then
+      echo "maestrode is not installed (nothing at $BIN)"
+    else
+      echo "maestrode is not installed (nothing at $BIN or $CONFIG_DIR)"
+    fi
+  else
+    echo "maestrode uninstalled."
+  fi
+  exit 0
+fi
 
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
 

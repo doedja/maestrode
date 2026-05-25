@@ -27,18 +27,46 @@ Back on the smaller tier now, the muscle calls are basically free. This repo is 
 
 ## Quickstart
 
-Install:
+Install on macOS / Linux / WSL:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doedja/maestrode/main/install.sh | bash
 ```
 
+Install on Windows (PowerShell, no admin needed):
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/doedja/maestrode/main/install.ps1 | iex
+```
+
+Windows prereqs: Git for Windows (`winget install Git.Git`, provides `bash`) and Python 3 (`winget install Python.Python.3.12`). The installer drops a `maestrode.cmd` shim so the command runs from cmd / PowerShell / Windows Terminal without needing to open Git Bash.
+
 Edit the env file with your API key:
 
 ```bash
+# macOS / Linux / WSL / Git Bash
 nvim ~/.config/maestrode/env
 # MAESTRODE_API_KEY=sk-...
 # MAESTRODE_ENDPOINT=https://api.deepseek.com/v1/chat/completions
+```
+
+```powershell
+# Windows PowerShell
+notepad $env:USERPROFILE\.config\maestrode\env
+```
+
+Uninstall (removes binary + config + sessions):
+
+```bash
+# macOS / Linux / WSL
+curl -fsSL https://raw.githubusercontent.com/doedja/maestrode/main/install.sh | bash -s -- --uninstall
+# add --keep-config to keep ~/.config/maestrode
+```
+
+```powershell
+# Windows
+& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/doedja/maestrode/main/install.ps1).Content)) -Uninstall
+# add -KeepConfig to keep $env:USERPROFILE\.config\maestrode
 ```
 
 ### If you use Claude Code
