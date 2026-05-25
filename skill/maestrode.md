@@ -67,6 +67,10 @@ Unsafe paths (absolute or `..`) refused. Exit 4 if no blocks parsed.
 
 ## Brief tactics (the rules that move the numbers)
 
+### Briefs and feedback stay in normal prose (not caveman/compressed)
+
+If a token-compression mode is active in the session (caveman, wenyan, etc), it applies to CHAT OUTPUT only. Briefs and system prompts sent to maestrode MUST stay normal-prose. Measured: compressing a brief 50% saved 29% prompt tokens but cost 81% MORE reasoning tokens, so net tokens AND wall time went UP (muscle "decompresses" by reasoning harder). Same applies to the FAIL/SUSPECT/FIX feedback format below: the *structure* helps, but each field is normal English, not caveman. The compression mode is a presentation layer for the user, not a context format for the cheap model.
+
 ### Structured failure feedback (5x reasoning reduction, measured)
 
 For every iteration turn, format the failure as:
