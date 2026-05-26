@@ -5,12 +5,15 @@
 # Idempotent: safe to re-run.
 #
 # Also drops the Claude Code skill at ~/.claude/skills/maestrode/SKILL.md
-# when ~/.claude exists. Set MAESTRODE_NO_SKILL=1 to skip, or
-# MAESTRODE_SKILL_DIR=/path to override.
+# and a PreToolUse reminder hook at ~/.claude/hooks/maestrode-reminder.sh
+# (registered in ~/.claude/settings.json) when ~/.claude exists.
+#   Set MAESTRODE_NO_SKILL=1 / MAESTRODE_NO_HOOK=1 to skip either.
+#   Override paths with MAESTRODE_SKILL_DIR / MAESTRODE_HOOK_DIR /
+#   MAESTRODE_SETTINGS_FILE.
 #
 # uninstall:
-#   ./install.sh --uninstall            (remove binary + config + sessions + skill)
-#   ./install.sh --uninstall --keep-config   (remove binary + skill only)
+#   ./install.sh --uninstall            (remove binary + config + sessions + skill + hook)
+#   ./install.sh --uninstall --keep-config   (remove binary + skill + hook only)
 #   curl -fsSL .../install.sh | bash -s -- --uninstall
 
 set -euo pipefail
@@ -20,6 +23,8 @@ BRANCH="${MAESTRODE_BRANCH:-main}"
 INSTALL_DIR="${MAESTRODE_INSTALL_DIR:-${HOME}/.local/bin}"
 CONFIG_DIR="${MAESTRODE_CONFIG_DIR:-${HOME}/.config/maestrode}"
 SKILL_DIR="${MAESTRODE_SKILL_DIR:-${HOME}/.claude/skills/maestrode}"
+HOOK_DIR="${MAESTRODE_HOOK_DIR:-${HOME}/.claude/hooks}"
+SETTINGS_FILE="${MAESTRODE_SETTINGS_FILE:-${HOME}/.claude/settings.json}"
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 
@@ -50,6 +55,42 @@ if [[ "$ACTION" == "uninstall" ]]; then
     rmdir "$SKILL_DIR" 2>/dev/null || true
     echo "removed $SKILL_FILE"
     removed=1
+  fi
+  HOOK_FILE="$HOOK_DIR/maestrode-reminder.sh"
+  if [[ -e "$HOOK_FILE" ]]; then
+    rm -f "$HOOK_FILE"
+    rmdir "$HOOK_DIR" 2>/dev/null || true
+    echo "removed $HOOK_FILE"
+    removed=1
+  fi
+  if [[ -f "$SETTINGS_FILE" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$SETTINGS_FILE" "$HOOK_FILE" <<'PY'
+import json, os, sys
+settings_path, hook_cmd = sys.argv[1], sys.argv[2]
+try:
+    with open(settings_path) as f:
+        d = json.load(f)
+except (json.JSONDecodeError, OSError):
+    sys.exit(0)
+pre = d.get("hooks", {}).get("PreToolUse", [])
+new_pre = []
+changed = False
+for entry in pre:
+    orig = entry.get("hooks", [])
+    kept = [hh for hh in orig if hh.get("command") != hook_cmd]
+    if len(kept) != len(orig):
+        changed = True
+    if kept:
+        e = dict(entry)
+        e["hooks"] = kept
+        new_pre.append(e)
+if changed:
+    d["hooks"]["PreToolUse"] = new_pre
+    with open(settings_path, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    print(f"removed hook entry from {settings_path}")
+PY
   fi
   if [[ $KEEP_CONFIG -eq 0 ]] && [[ -d "$CONFIG_DIR" ]]; then
     rm -rf "$CONFIG_DIR"
@@ -121,6 +162,67 @@ if [[ "${MAESTRODE_NO_SKILL:-0}" != "1" ]] && [[ -d "${HOME}/.claude" || -n "${M
       echo "warn: could not download skill from ${RAW_BASE}/skill/maestrode.md" >&2
     fi
     rm -f "$SKILL_TMP"
+  fi
+fi
+
+# PreToolUse reminder hook. Fires on Edit/Write while ~/.config/maestrode/active
+# exists, nudging brain to either delegate or tag the turn. Soft, no block.
+# Override: MAESTRODE_NO_HOOK=1 to skip, MAESTRODE_HOOK_DIR / MAESTRODE_SETTINGS_FILE to relocate.
+if [[ "${MAESTRODE_NO_HOOK:-0}" != "1" ]] && [[ -d "${HOME}/.claude" || -n "${MAESTRODE_HOOK_DIR:-}" ]]; then
+  LOCAL_HOOK=""
+  if [[ -n "${SCRIPT_DIR:-}" ]] && [[ -f "${SCRIPT_DIR}/hooks/maestrode-reminder.sh" ]]; then
+    LOCAL_HOOK="${SCRIPT_DIR}/hooks/maestrode-reminder.sh"
+  fi
+  mkdir -p "$HOOK_DIR"
+  HOOK_TARGET="${HOOK_DIR}/maestrode-reminder.sh"
+  if [[ -n "$LOCAL_HOOK" ]]; then
+    install -m 0755 "$LOCAL_HOOK" "$HOOK_TARGET"
+    echo "synced hook from ${LOCAL_HOOK} -> ${HOOK_TARGET}"
+  else
+    HOOK_TMP=$(mktemp)
+    if curl -fsSL "${RAW_BASE}/hooks/maestrode-reminder.sh" -o "$HOOK_TMP"; then
+      install -m 0755 "$HOOK_TMP" "$HOOK_TARGET"
+      echo "synced hook -> ${HOOK_TARGET}"
+    else
+      echo "warn: could not download hook from ${RAW_BASE}/hooks/maestrode-reminder.sh" >&2
+    fi
+    rm -f "$HOOK_TMP"
+  fi
+  # Idempotent settings.json registration.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$SETTINGS_FILE" "$HOOK_TARGET" <<'PY'
+import json, os, sys
+settings_path, hook_cmd = sys.argv[1], sys.argv[2]
+matcher = "Edit|Write|MultiEdit|NotebookEdit"
+if os.path.exists(settings_path):
+    try:
+        with open(settings_path) as f:
+            d = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"warn: {settings_path} is not valid JSON, skipping hook registration: {e}", file=sys.stderr)
+        sys.exit(0)
+else:
+    d = {}
+hooks = d.setdefault("hooks", {})
+pre = hooks.setdefault("PreToolUse", [])
+already = any(
+    any(hh.get("command") == hook_cmd for hh in entry.get("hooks", []))
+    for entry in pre
+)
+if already:
+    sys.exit(0)
+pre.append({
+    "matcher": matcher,
+    "hooks": [{"type": "command", "command": hook_cmd}]
+})
+os.makedirs(os.path.dirname(settings_path) or ".", exist_ok=True)
+with open(settings_path, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+print(f"registered hook in {settings_path}")
+PY
+  else
+    echo "warn: python3 not on PATH; add the PreToolUse entry to ${SETTINGS_FILE} by hand." >&2
   fi
 fi
 

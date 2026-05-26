@@ -4,12 +4,15 @@
 # Idempotent: safe to re-run.
 #
 # Also drops the Claude Code skill at %USERPROFILE%\.claude\skills\maestrode\SKILL.md
-# when ~/.claude exists. Set $env:MAESTRODE_NO_SKILL=1 to skip, or
-# $env:MAESTRODE_SKILL_DIR=... to override.
+# and a PreToolUse reminder hook at %USERPROFILE%\.claude\hooks\maestrode-reminder.sh
+# (registered in %USERPROFILE%\.claude\settings.json) when ~/.claude exists.
+#   Set $env:MAESTRODE_NO_SKILL=1 / $env:MAESTRODE_NO_HOOK=1 to skip either.
+#   Override paths with $env:MAESTRODE_SKILL_DIR / $env:MAESTRODE_HOOK_DIR /
+#   $env:MAESTRODE_SETTINGS_FILE.
 #
 # uninstall:
-#   .\install.ps1 -Uninstall                (remove binary + config + sessions + skill)
-#   .\install.ps1 -Uninstall -KeepConfig    (remove binary + skill only)
+#   .\install.ps1 -Uninstall                (remove binary + config + sessions + skill + hook)
+#   .\install.ps1 -Uninstall -KeepConfig    (remove binary + skill + hook only)
 #
 # requires:
 #   - Git for Windows (provides bash.exe). Install: winget install Git.Git
@@ -38,8 +41,74 @@ $Branch  = if ($env:MAESTRODE_BRANCH)  { $env:MAESTRODE_BRANCH }  else { 'main' 
 $InstallDir = if ($env:MAESTRODE_INSTALL_DIR) { $env:MAESTRODE_INSTALL_DIR } else { "$env:USERPROFILE\.local\bin" }
 $ConfigDir  = if ($env:MAESTRODE_CONFIG_DIR)  { $env:MAESTRODE_CONFIG_DIR }  else { "$env:USERPROFILE\.config\maestrode" }
 $SkillDir   = if ($env:MAESTRODE_SKILL_DIR)   { $env:MAESTRODE_SKILL_DIR }   else { "$env:USERPROFILE\.claude\skills\maestrode" }
+$HookDir    = if ($env:MAESTRODE_HOOK_DIR)    { $env:MAESTRODE_HOOK_DIR }    else { "$env:USERPROFILE\.claude\hooks" }
+$SettingsFile = if ($env:MAESTRODE_SETTINGS_FILE) { $env:MAESTRODE_SETTINGS_FILE } else { "$env:USERPROFILE\.claude\settings.json" }
 $ClaudeRoot = "$env:USERPROFILE\.claude"
 $RawBase = "https://raw.githubusercontent.com/$Repo/$Branch"
+
+# Locate python once for settings.json patching (used in both install and uninstall).
+$PyCmd = Get-Command python3 -ErrorAction SilentlyContinue
+if (-not $PyCmd) { $PyCmd = Get-Command python -ErrorAction SilentlyContinue }
+
+$PySettingsInstall = @'
+import json, os, sys
+settings_path, hook_cmd = sys.argv[1], sys.argv[2]
+matcher = "Edit|Write|MultiEdit|NotebookEdit"
+if os.path.exists(settings_path):
+    try:
+        with open(settings_path) as f:
+            d = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"warn: {settings_path} is not valid JSON, skipping hook registration: {e}", file=sys.stderr)
+        sys.exit(0)
+else:
+    d = {}
+hooks = d.setdefault("hooks", {})
+pre = hooks.setdefault("PreToolUse", [])
+already = any(
+    any(hh.get("command") == hook_cmd for hh in entry.get("hooks", []))
+    for entry in pre
+)
+if already:
+    sys.exit(0)
+pre.append({
+    "matcher": matcher,
+    "hooks": [{"type": "command", "command": hook_cmd}]
+})
+os.makedirs(os.path.dirname(settings_path) or ".", exist_ok=True)
+with open(settings_path, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+print(f"registered hook in {settings_path}")
+'@
+
+$PySettingsUninstall = @'
+import json, os, sys
+settings_path, hook_cmd = sys.argv[1], sys.argv[2]
+try:
+    with open(settings_path) as f:
+        d = json.load(f)
+except (json.JSONDecodeError, OSError):
+    sys.exit(0)
+pre = d.get("hooks", {}).get("PreToolUse", [])
+new_pre = []
+changed = False
+for entry in pre:
+    orig = entry.get("hooks", [])
+    kept = [hh for hh in orig if hh.get("command") != hook_cmd]
+    if len(kept) != len(orig):
+        changed = True
+    if kept:
+        e = dict(entry)
+        e["hooks"] = kept
+        new_pre.append(e)
+if changed:
+    d["hooks"]["PreToolUse"] = new_pre
+    with open(settings_path, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    print(f"removed hook entry from {settings_path}")
+'@
 
 function Remove-PathEntry {
     param([string]$Dir)
@@ -78,6 +147,18 @@ if ($Uninstall) {
         }
         Write-Host "removed $skillFile"
         $removed = $true
+    }
+    $hookFile = Join-Path $HookDir 'maestrode-reminder.sh'
+    if (Test-Path $hookFile) {
+        Remove-Item -Force $hookFile
+        if ((Test-Path $HookDir) -and -not (Get-ChildItem -Force $HookDir)) {
+            Remove-Item -Force $HookDir
+        }
+        Write-Host "removed $hookFile"
+        $removed = $true
+    }
+    if ((Test-Path $SettingsFile) -and $PyCmd) {
+        $PySettingsUninstall | & $PyCmd.Source - $SettingsFile $hookFile
     }
     if (-not $KeepConfig -and (Test-Path $ConfigDir)) {
         Remove-Item -Recurse -Force $ConfigDir
@@ -166,6 +247,34 @@ if ($env:MAESTRODE_NO_SKILL -ne '1' -and ((Test-Path $ClaudeRoot) -or $env:MAEST
         } catch {
             Write-Warning "could not download skill from $RawBase/skill/maestrode.md: $_"
         }
+    }
+}
+
+# PreToolUse reminder hook. Fires on Edit/Write while ~/.config/maestrode/active
+# exists, nudging brain to either delegate or tag the turn. Soft, no block.
+if ($env:MAESTRODE_NO_HOOK -ne '1' -and ((Test-Path $ClaudeRoot) -or $env:MAESTRODE_HOOK_DIR)) {
+    New-Item -ItemType Directory -Force -Path $HookDir | Out-Null
+    $hookTarget = Join-Path $HookDir 'maestrode-reminder.sh'
+    $localHook = $null
+    if ($ScriptDir) {
+        $candidate = Join-Path $ScriptDir 'hooks\maestrode-reminder.sh'
+        if (Test-Path $candidate) { $localHook = $candidate }
+    }
+    if ($localHook) {
+        Copy-Item -Force $localHook $hookTarget
+        Write-Host "synced hook from $localHook -> $hookTarget"
+    } else {
+        try {
+            Invoke-WebRequest -Uri "$RawBase/hooks/maestrode-reminder.sh" -OutFile $hookTarget -UseBasicParsing
+            Write-Host "synced hook -> $hookTarget"
+        } catch {
+            Write-Warning "could not download hook from $RawBase/hooks/maestrode-reminder.sh: $_"
+        }
+    }
+    if ($PyCmd) {
+        $PySettingsInstall | & $PyCmd.Source - $SettingsFile $hookTarget
+    } else {
+        Write-Warning "python not on PATH; add the PreToolUse entry to $SettingsFile by hand."
     }
 }
 
