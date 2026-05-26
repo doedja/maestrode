@@ -58,28 +58,17 @@ curl -fsSL https://raw.githubusercontent.com/doedja/maestrode/main/install.sh | 
 ```
 
 ```powershell
-# Windows
-& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/doedja/maestrode/main/install.ps1).Content)) -Uninstall
+# Windows: download then run with -Uninstall
+iwr -useb https://raw.githubusercontent.com/doedja/maestrode/main/install.ps1 -OutFile install.ps1
+.\install.ps1 -Uninstall
 # add -KeepConfig to keep $env:USERPROFILE\.config\maestrode
 ```
 
-### If you use Claude Code
+### Use it
 
-Drop the skill in:
+In Claude Code: say **`maestrode on`** or `/maestrode`. The skill stays on for the rest of the session; Claude delegates code-writing to the cheap muscle. Say `maestrode off` to drop back.
 
-```bash
-mkdir -p ~/.claude/skills/maestrode
-cp skill/maestrode.md ~/.claude/skills/maestrode/SKILL.md
-```
-
-Then in any Claude Code session, say **`maestrode on`** (or `/maestrode`). The skill activates and Claude starts delegating code-writing to the cheap muscle for the rest of the session.
-
-### If you use the CLI directly
-
-```bash
-maestrode "write a function that validates an email"
-./examples/quickstart.sh    # runnable end-to-end demo, ~30 seconds
-```
+CLI direct: `maestrode "task"`. See `examples/quickstart.sh` for a 30-second runnable demo.
 
 ## Where to get the cheap model
 
@@ -106,9 +95,10 @@ Set `MAESTRODE_API_KEY` and `MAESTRODE_ENDPOINT` in `~/.config/maestrode/env`.
 
 ## Pairs well with
 
-[rtk](https://www.rtk-ai.app/) (`brew install rtk`): rewrites your `ls`, `git`, `gh`, `tree`, `read` commands into token-compact output. Different layer than maestrode. Stacks cleanly. Not affiliated.
+- [rtk](https://www.rtk-ai.app/) (`brew install rtk`): token-compact rewrites of `ls`, `git`, `gh`, `tree`, `read` output. Not affiliated.
+- [caveman](https://github.com/JuliusBrussee/caveman) skill (Claude Code): ultra-compressed chat output to the user.
 
-[caveman](https://github.com/JuliusBrussee/caveman) skill (Claude Code): ultra-compressed chat output. Stacks with maestrode automatically: the maestrode skill keeps briefs to the muscle in normal prose while caveman still compresses your chat reply. Nothing for you to configure. (The rule exists because compressing the brief itself net-costs more tokens: muscle burns reasoning to decompress.)
+**Stack all three (rtk + caveman + maestrode)** and Claude tokens drop across every layer: shell output (rtk), chat replies (caveman), code drafting (maestrode). No config needed, the skills know how to compose.
 
 ## Big jobs
 
