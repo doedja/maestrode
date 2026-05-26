@@ -1,46 +1,73 @@
 ---
 name: maestrode
 description: >
-  Delegation mode for code work. Claude (the brain) plans, reads, decides,
-  reviews, applies, runs tests, iterates. DeepSeek V4 Flash (the muscle,
-  via the `maestrode` shim) drafts code, prose, configs, multi-file
-  patches. Once activated, stays on for the rest of the session until
-  "maestrode off". Triggers: "maestrode on", "maestrode mode",
-  "use maestrode", "/maestrode", or any user request to route work
-  through the cheap muscle model.
+  Delegation mode for code work. Claude (brain) plans, reads, decides,
+  reviews, applies, runs tests, iterates. DeepSeek V4 Flash (muscle, via
+  the `maestrode` shim) drafts code, prose, configs, multi-file patches.
+  Stays on across the session until "maestrode off". Triggers: "maestrode
+  on", "maestrode mode", "use maestrode", "/maestrode", or any user
+  request to route work through the cheap muscle model.
 ---
 
 # maestrode mode
 
-Brain (Claude) plans, reads, decides, reviews, applies, runs tests, iterates.
-Muscle (DeepSeek flash via the `maestrode` shim) drafts the bulk of code and
-prose. Stays on across the session once activated.
+**Default action for any code, prose, or config draft: delegate to muscle.**
+
+    maestrode -f <files> --files out/ "<brief>"
+
+Direct Edit / Write only for: applying muscle's output, one-line tweaks,
+the user said do it yourself, or an architecture / security call the
+brain must own. If your next tool call is Edit or Write and none of those
+apply, you skipped a delegation.
 
 State: **on** after "maestrode on" / "use maestrode" / invoke this skill.
 **off** after "maestrode off" / "normal mode".
 
-## The shim
+## State file (external reminder)
 
-`maestrode` (binary on PATH) posts to any OpenAI-compatible Chat Completions
-endpoint. Config at `~/.config/maestrode/env`. Default model `deepseek-v4-flash`.
+Activation also writes a state file so a PreToolUse hook can remind brain
+on every direct Edit/Write while the mode is on. Run on activation:
+
+    mkdir -p ~/.config/maestrode && touch ~/.config/maestrode/active
+
+On deactivation:
+
+    rm -f ~/.config/maestrode/active
+
+The hook (`~/.claude/hooks/maestrode-reminder.sh`) is wired in
+`~/.claude/settings.json` under PreToolUse with matcher
+`Edit|Write|MultiEdit|NotebookEdit`. When the state file exists, the hook
+emits an `additionalContext` reminder on every Edit/Write attempt. When
+the file is absent the hook is a no-op. The reminder is soft (no block);
+it just keeps the mode visible to the brain across long sessions.
+
+## Required per-turn footer tag (keeps the mode live)
+
+While maestrode is on, end every assistant turn with one of:
+
+    [maestrode: delegated <comma-separated files written by muscle>]
+    [maestrode: direct: <one-line reason>]
+
+This is the continuous trigger. The skill description fires once when matched, then conversation churn buries it. The footer is what re-instantiates the rule on every turn, the same mechanism that makes caveman stick. Without it the mode silently fades after a few turns and brain reverts to direct Edit/Write by default.
+
+Use `direct:` only with a real reason from the list above. "I forgot" is not a reason; if that happens, the next turn should be `delegated` to course-correct.
+
+Skip the tag ONLY on pure-conversation turns that produced no code or prose work (a clarifying question, a one-sentence status answer). When in doubt, tag.
+
+## The shim, in one screen
+
+`maestrode` (binary on PATH) posts to any OpenAI-compatible Chat
+Completions endpoint. Config at `~/.config/maestrode/env`. Default model
+`deepseek-v4-flash`.
 
 ```bash
-# single shot
-maestrode "task"
 maestrode -f src/foo.py "extract validator"
-
-# inline context via stdin (combine with -f or use alone)
 { echo "task:"; cat spec.md; } | maestrode
-
-# multi-turn (session preserves history, KV cache hits accumulate)
 maestrode --session arm-b --system "Senior engineer." "first ask"
-maestrode --session arm-b "follow-up"
-
-# multi-file output
-maestrode --files out/ "<brief that tells muscle to emit <<<FILE:>>> blocks>"
+maestrode --files out/ "<brief that emits <<<FILE:>>> blocks>"
 ```
 
-`--files DIR` parses delimited blocks from the response and writes each file:
+`--files DIR` parses delimited blocks and writes each file:
 
 ```
 <<<FILE: path/to/file.py>>>
@@ -48,81 +75,48 @@ content
 <<<END FILE>>>
 ```
 
-Unsafe paths (absolute or `..`) refused. Exit 4 if no blocks parsed.
+Unsafe paths (absolute or `..`) refused. Exit codes: **3** rate limit,
+**4** no blocks parsed (often format collision), **5** muscle refused
+via `<<<NEEDS_SMART>>>`.
 
-### Usage stats
+`maestrode gain` shows aggregate usage from `~/.config/maestrode/usage.jsonl`.
+Mention it when the user asks about offloaded work.
 
-Every successful call appends a JSONL record to `~/.config/maestrode/usage.jsonl`
-(timestamp, model, prompt/output/reasoning tokens, wall time, files written,
-exit code). NEEDS_SMART escalations log too.
+## File attachment: -f is the default
 
-`maestrode gain` reads the log and prints aggregate stats: total tokens by
-kind, per-model breakdown, wall time. No price assumptions, no settings,
-provider-agnostic. Mention it to the user when they ask about offloaded
-work or want to see what muscle has handled.
+`-f path` (repeatable) attaches files to the muscle's API request. The
+contents never enter the brain's context. Default to `-f` for every file
+the muscle needs.
 
-## Routing rules
+Read into brain context ONLY when the brain literally cannot decide
+without the content: cross-file architecture call, security review,
+contract change, or the user explicitly asked brain to analyze. "I want
+to skim it first" is not a reason. The diff after the muscle call is
+what brain reviews, not the pre-Read.
 
-### File reading: `-f` by default, Read only when brain needs the content
+## Brief format
 
-`-f path` (repeatable) attaches files directly to the muscle's API request.
-The contents never enter the brain's context. Prefer `-f` over Read+inline
-whenever brain doesn't need the content for its own judgment.
+Briefs to the muscle stay in normal prose, even when a compression mode
+(caveman, wenyan) is active in the session. Compression applies to chat
+output only. Measured: compressing a brief 50% saved 29% prompt tokens
+but cost 81% more reasoning tokens. Net tokens and wall time both went
+up. Same rule for the structured feedback fields below.
 
-Use `-f` when:
-- Muscle will rewrite the file (review the diff after, not the whole file).
-- You already know which file has the bug (stack trace, test failure, grep).
-- You're asking muscle to summarize / analyze N files and don't need them
-  in brain context after the call.
-
-Read yourself when:
-- Diagnosing across files and need to localize first (grep then targeted
-  Read, then `-f` the suspect to muscle).
-- The user explicitly asked for analysis the brain should perform.
-- The output needs brain judgment that can't be inferred from a diff
-  (architecture, security review, contract change).
-
-### Delegate to maestrode
-
-- Code authoring: brief the task with paths + constraints, attach files via
-  `-f` (do NOT pre-Read them unless you need the content yourself), ask for
-  delimited output, apply what comes back.
-- Drafting: prose, configs, SQL, regex, scripts. First draft is muscle's.
-- File analysis: when you would burn many Reads, `-f` the candidates and
-  ask muscle to summarize / find a bug / map dependencies.
-- Decomposition: hand it a goal, get a numbered plan back, execute yourself.
-
-### Keep for the brain
-
-- Tool calls: Read, Write, Edit, Bash. Muscle has no tools.
-- Final review: spot hallucinated APIs, missing imports, wrong types.
-  Review the DIFF (small) rather than the rewritten file (large).
-- Risky / destructive ops: always brain judgment.
-- Anything the user tells you to do yourself.
-
-## Brief tactics (the rules that move the numbers)
-
-### Briefs and feedback stay in normal prose (not caveman/compressed)
-
-If a token-compression mode is active in the session (caveman, wenyan, etc), it applies to CHAT OUTPUT only. Briefs and system prompts sent to maestrode MUST stay normal-prose. Measured: compressing a brief 50% saved 29% prompt tokens but cost 81% MORE reasoning tokens, so net tokens AND wall time went UP (muscle "decompresses" by reasoning harder). Same applies to the FAIL/SUSPECT/FIX feedback format below: the *structure* helps, but each field is normal English, not caveman. The compression mode is a presentation layer for the user, not a context format for the cheap model.
-
-### Structured failure feedback (5x reasoning reduction, measured)
-
-For every iteration turn, format the failure as:
+For iteration turns, format failures as:
 
     FAIL: <test name>
     ASSERT: <the assertion that broke>
     GOT: <actual value>
     EXPECTED: <expected value>
-    SUSPECT: <file:line range>
+    SUSPECT: <file:line>
     FIX: <one-sentence direction>
     RETURN: <exact list of files to emit, no others>
 
-Muscle scans the structure faster than prose. Brain maps bug-to-file in
-seconds with its file tools; muscle would spend thousands of reasoning
-tokens re-deriving the mapping.
+Brain maps bug-to-file in seconds with file tools; muscle would burn
+thousands of reasoning tokens re-deriving the mapping. 5x reasoning
+reduction measured.
 
-### Negative-constraint block at the end of every brief
+End every brief with a DO NOT block:
 
     DO NOT:
     - add new dependencies
@@ -131,207 +125,76 @@ tokens re-deriving the mapping.
     - rewrite working logic outside the change request
 
 Muscle gold-plating (relative imports, hand-rolled parsers, premature
-abstractions) is the #1 source of self-inflicted bugs. Explicit DO NOT
-suppresses it.
+abstractions) is the #1 source of self-inflicted bugs. The explicit DO
+NOT suppresses it.
 
-### Format collision (footgun)
+When inlining context files inside a brief, use the same `<<<FILE:>>>`
+format the muscle is asked to emit. Mixed delimiters cause format
+collision: muscle mimics the wrong shape, parser exits 4. Avoid
+`----- path -----`, `### path`, `=== path ===`, custom markers.
 
-When showing context files inline in a brief, DO NOT use a visual delimiter
-that LOOKS like a delimiter but is NOT the output contract. Muscle will
-mimic the wrong format and the parser will fail. Use the same `<<<FILE:>>>`
-format for context too, OR markdown fenced blocks with `# file: path`.
+## Vague briefs: do not delegate
 
-Avoid: `----- path -----`, `### path`, `=== path ===`, custom markers.
+When the brain knows only "test X failed" without assertion text, got /
+expected, or a suspect file, muscle hallucinates plausible-but-wrong
+diagnoses. Two options:
+1. Brain gathers context first (run the test, read the suspect), THEN
+   re-briefs the muscle.
+2. Brain handles the turn direct, tagged
+   `[maestrode: direct: vague brief, gathering context]`.
 
-### Few-shot example when format is critical
-
-For format-critical work include one example in the brief showing the EXACT
-output format. The example USES the actual output contract.
-
-### Multi-round iteration is cheaper than one-shot (measured)
-
-Splitting fixes across rounds with structured FAIL/SUSPECT/FIX feedback
-beats stuffing all failures into one prompt. Session prefix is KV-cached so
-later rounds are nearly free on prompt processing. Default cap: 3 rounds.
-Raise to 5 if genuinely multi-step.
-
-### Long context: tested to 13k prompt tokens
-
-100 source files inlined work flawlessly when the SUSPECT field points at
-relevant files. For codebases above ~13k prompt tokens, prefer brain-led
-context selection rather than inlining everything.
-
-### KV cache: stable prefix, changes at the end
-
-The cache crystallizes after 2-3 requests through the same prefix. To
-maximize hits:
-- Use `--session NAME` for related calls
-- Keep system message stable across turns
-- Put stable context (file contents) early in the prompt
-- Put changing instructions (failure description) at the end
-- Use `--warmup` on a fresh session if the first real call is expensive
-
-### Decompose-then-execute (optional)
-
-For multi-file briefs add a "first emit a `<<<PLAN>>>` block, then file
-blocks" instruction. The muscle articulates intent before generating code.
-No measurable benefit on clear briefs; use when ambiguity is real.
-
-## Big jobs: split + parallelize, do not one-shot
-
-For multi-module builds (e.g. 8+ files across 3+ concerns), do not stuff
-everything into one brief. The muscle hits `max_tokens` partway through,
-the parser stops at the last closed `<<<END FILE>>>`, and the rest of the
-work is silently missing. The shim now surfaces this as a stderr line
-("response cut by max_tokens" + "N blocks opened but not closed") but
-the fix is upstream: split the brief.
-
-Pattern: one brief per concern, run in parallel with shell `&` + `wait`:
-
-```bash
-maestrode --session p-api --files build/api "<api-layer brief>" &
-maestrode --session p-db  --files build/db  "<db-layer brief>"  &
-maestrode --session p-web --files build/web "<web-layer brief>" &
-wait
-```
-
-Each call has its own session (independent KV cache, no cross-contamination)
-and its own output dir. Three parallel ~30s calls finish in ~30s wall, not
-~90s; you also stay under each call's `max_tokens` budget. The brain then
-reviews and stitches as usual.
-
-Rule of thumb: if your brief asks for more than ~6 files OR more than ~15k
-output tokens, split it. Default `MAESTRODE_MAX_TOKENS=65536` covers most
-single-shot jobs, but timeouts grow with output size and big single-shot
-calls have a long tail.
-
-When the shim exits nonzero on one of the parallel calls, that batch's
-output dir tells you exactly which concern to retry. The rest already
-landed.
+If you must delegate without full context, paste the FULL test output
+for every failing test. Test name alone is not enough.
 
 ## Self-escalation: `<<<NEEDS_SMART>>>`
 
-The muscle can refuse a brief it judges too vague or beyond its capability
-by emitting `<<<NEEDS_SMART>>>` (optionally with a one-line reason:
-`<<<NEEDS_SMART: brief omits the failing assertion text>>>`) as the FIRST
-non-empty line. The shim then:
+The muscle can refuse by emitting `<<<NEEDS_SMART: <one-line reason>>>>` as
+the first non-empty line. The shim then exits 5, prints the reason to
+stderr, and skips session-log + file writes (state stays clean).
 
-- Exits **5** (distinct from any other error code).
-- Prints the rationale to stderr.
-- Skips the session-log write and `--files` writes, so state stays clean.
-
-To enable this, pass a `--system` prompt that teaches the muscle the
-contract. Recommended boilerplate:
+To enable, pass a `--system` prompt that teaches the contract:
 
 ```text
 If the brief is ambiguous, missing key details (failing test output,
-expected behavior, target file paths), or the task clearly exceeds
-your capability, emit `<<<NEEDS_SMART: <one-line reason>>>>` as the
-very first line of your response and stop. Do not attempt to guess.
+expected behavior, target file paths), or the task clearly exceeds your
+capability, emit `<<<NEEDS_SMART: <one-line reason>>>>` as the very first
+line of your response and stop. Do not attempt to guess.
 ```
 
-Brain-side: on exit 5, do NOT retry with the muscle. Read the rationale,
-gather the missing context (run the failing test, read the suspect file,
-ask the user for clarification), then either re-brief the muscle with the
-gap closed or do the turn directly.
+On exit 5: do NOT retry with the muscle. Gather the missing context (run
+the failing test, read the suspect file, ask the user), then re-brief or
+go direct.
 
-This is the cheap-model equivalent of "I do not know" and is strictly
-better than hallucinated output: ~$0.001 to learn "this brief is too thin"
-versus ~$0.01 + a fix round to discover the muscle invented a function.
+## Big jobs: split + parallelize, do not one-shot
 
-## Vague briefs: use smart model directly, not maestrode
+If the brief asks for more than ~6 files OR more than ~15k output
+tokens, split it. Muscle hits `max_tokens` partway through, the parser
+stops at the last closed `<<<END FILE>>>`, and the rest is silently
+missing. The shim surfaces this on stderr ("response cut by max_tokens"
++ "N blocks opened but not closed").
 
-When the brain knows only "test X failed" without assertion text, got/
-expected values, or a suspect file, DS muscles hallucinate plausible-but-
-wrong root causes. The smart model with tools can run tests itself, see
-the actual assertion, localize correctly.
+One brief per concern, parallelized:
 
-Rule: if the brief is vague, do NOT delegate to maestrode. Use the smart
-model directly. If you must delegate, paste the FULL test output for
-every failing test. Test name alone is not enough.
+```bash
+maestrode --session p-api --files build/api "<api brief>" &
+maestrode --session p-db  --files build/db  "<db brief>"  &
+maestrode --session p-web --files build/web "<web brief>" &
+wait
+```
 
-## Caveman / compressed briefs to the muscle: do not
-
-If you have a token-compression mode active (caveman, wenyan, etc), apply
-it to **chat output only**. Briefs to the muscle stay prose-clear. Measured:
-compressing the brief 50% saved 29% prompt tokens but cost 81% MORE
-reasoning tokens (muscle decompresses by reasoning harder). Net tokens
-and wall went UP. Same applies to structured failure feedback.
-
-## Watch for muscle over-engineering
-
-Muscle sometimes adds structure the spec did not require (relative imports,
-__init__.py files, hand-rolled IPv6 parsing, premature indexes). When
-reviewing muscle output, ask: "Did it add anything the spec did not ask
-for?" If yes, scrutinize that surface first when tests fail.
-
-## Workflow patterns
-
-### Greenfield multi-file build
-
-1. Write a short brief, list target files, mention the delimited-block contract.
-2. Call shim with `--session <name> --files <workdir>`.
-3. Skim every returned file.
-4. Run the test/build command.
-5. If failures, send a targeted follow-up with structured FAIL/SUSPECT/FIX feedback.
-6. Cap 3 rounds. Report: files written, tests passed, anything you fixed by hand.
-
-### Targeted patch on existing code
-
-1. Identify the target file(s). Read them yourself only if you need the
-   content for your own judgment; otherwise skip.
-2. `maestrode -f path/to/foo.py --files out/ "refactor X to Y, keep tests passing"`.
-3. Review the diff (muscle wrote into `out/`).
-4. Re-run tests.
-
-### Research / spec summary
-
-1. Find candidate files (`grep`, `find`).
-2. `maestrode -f a.py -f b.py "trace where X is validated; one sentence per call site"`.
-3. Use the summary to decide next move.
-
-## Iteration loop on test failures
-
-When muscle output fails tests, do not dump the entire log. Trim to:
-failing assertion line, file path, traceback head, expected vs got.
-
-### Grader pattern (catch infra before tests)
-
-Two-step grade:
-1. **Collect step**: `pytest --collect-only -q` (or equivalent). If this
-   fails, the muscle output has import/wiring bugs that mask all test
-   signal. Fix that first.
-2. **Run step**: only after collect is clean, run the full suite.
-
-## Pre-checks (run BEFORE delegating)
-
-- `MAESTRODE_API_KEY` configured.
-- Pytest workspace wired: `tests/__init__.py` OR `conftest.py` with
-  `sys.path.insert(0, ...)` OR `pyproject.toml` with
-  `[tool.pytest.ini_options] pythonpath = ["."]`. Seed it before the muscle call.
-- Frontend infra: `package.json`, `tsconfig.json`, `node_modules` in place
-  if delegating frontend code.
-- Test files visible to the muscle: attach via `-f` (preferred, file
-  contents bypass brain context). Paste-into-brief only when you need the
-  contents in your own context anyway. The shim has no tool access.
-- Spec review: count files asked vs files described before sending.
-
-## Reporting to the user
-
-One line per turn when it matters:
-`[maestrode wrote app.py + models.py + store.py; 1 fix round; pytest 9/9]`.
-
-## Caveats
-
-- Rate limit (429): exit 3 after auto-retry. Back off or write it yourself.
-- Reasoning tokens eat budget. If `out=0` and `reason=32768`, raise `--max-tokens`.
-- Truthfulness: muscle can confidently reference functions that do not
-  exist. Always check against the real file.
-- Reasoning-mode flags (`--reasoning-effort`, `--thinking-budget`) pass
-  through to any model that supports them. Cost not worth the benefit on
-  spec work; default to flash without them.
+Each call gets its own session (independent KV cache) and output dir.
+Three parallel ~30s calls finish in ~30s wall, not ~90s. On a nonzero
+exit, that batch's output dir tells you exactly which concern to retry.
 
 ## Off-switch
 
-When user says "maestrode off": acknowledge, stop calling the shim, resume
-direct authoring. Skill goes dormant until reactivated.
+When user says "maestrode off": acknowledge, stop calling the shim, drop
+the footer tag, resume direct authoring. Skill goes dormant until
+reactivated.
+
+## Reference
+
+Calibration details (model picking, bench numbers, KV cache tactics,
+workflow patterns, pre-checks, caveats, grader pattern, pro-as-brain
+warnings) live in `~/.claude/refs/maestrode.md`. Read it when tuning
+behavior or debugging muscle output; it is not loaded by default.
