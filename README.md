@@ -108,6 +108,8 @@ Set `MAESTRODE_API_KEY` and `MAESTRODE_ENDPOINT` in `~/.config/maestrode/env`.
 
 [rtk](https://www.rtk-ai.app/) (`brew install rtk`): rewrites your `ls`, `git`, `gh`, `tree`, `read` commands into token-compact output. Different layer than maestrode. Stacks cleanly. Not affiliated.
 
+[caveman](https://github.com/JuliusBrussee/caveman) skill (Claude Code): ultra-compressed chat output. Stacks with maestrode automatically: the maestrode skill keeps briefs to the muscle in normal prose while caveman still compresses your chat reply. Nothing for you to configure. (The rule exists because compressing the brief itself net-costs more tokens: muscle burns reasoning to decompress.)
+
 ## Big jobs
 
 For multi-module builds, split the brief and dispatch in parallel:
