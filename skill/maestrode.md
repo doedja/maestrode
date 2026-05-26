@@ -63,19 +63,40 @@ work or want to see what muscle has handled.
 
 ## Routing rules
 
+### File reading: `-f` by default, Read only when brain needs the content
+
+`-f path` (repeatable) attaches files directly to the muscle's API request.
+The contents never enter the brain's context. Prefer `-f` over Read+inline
+whenever brain doesn't need the content for its own judgment.
+
+Use `-f` when:
+- Muscle will rewrite the file (review the diff after, not the whole file).
+- You already know which file has the bug (stack trace, test failure, grep).
+- You're asking muscle to summarize / analyze N files and don't need them
+  in brain context after the call.
+
+Read yourself when:
+- Diagnosing across files and need to localize first (grep then targeted
+  Read, then `-f` the suspect to muscle).
+- The user explicitly asked for analysis the brain should perform.
+- The output needs brain judgment that can't be inferred from a diff
+  (architecture, security review, contract change).
+
 ### Delegate to maestrode
 
-- Code authoring: gather context (Read the relevant files), brief the task
-  with paths + constraints, ask for delimited output, apply what comes back.
+- Code authoring: brief the task with paths + constraints, attach files via
+  `-f` (do NOT pre-Read them unless you need the content yourself), ask for
+  delimited output, apply what comes back.
 - Drafting: prose, configs, SQL, regex, scripts. First draft is muscle's.
-- File analysis: when you would burn many Reads, gather contents and ask
-  muscle to summarize / find a bug / map dependencies.
+- File analysis: when you would burn many Reads, `-f` the candidates and
+  ask muscle to summarize / find a bug / map dependencies.
 - Decomposition: hand it a goal, get a numbered plan back, execute yourself.
 
 ### Keep for the brain
 
 - Tool calls: Read, Write, Edit, Bash. Muscle has no tools.
 - Final review: spot hallucinated APIs, missing imports, wrong types.
+  Review the DIFF (small) rather than the rewritten file (large).
 - Risky / destructive ops: always brain judgment.
 - Anything the user tells you to do yourself.
 
@@ -257,9 +278,10 @@ for?" If yes, scrutinize that surface first when tests fail.
 
 ### Targeted patch on existing code
 
-1. Read the file(s) yourself.
-2. `maestrode -f path/to/foo.py "refactor X to Y, keep tests passing"`.
-3. Apply via `Edit` so the diff stays small.
+1. Identify the target file(s). Read them yourself only if you need the
+   content for your own judgment; otherwise skip.
+2. `maestrode -f path/to/foo.py --files out/ "refactor X to Y, keep tests passing"`.
+3. Review the diff (muscle wrote into `out/`).
 4. Re-run tests.
 
 ### Research / spec summary
@@ -289,8 +311,9 @@ Two-step grade:
   `[tool.pytest.ini_options] pythonpath = ["."]`. Seed it before the muscle call.
 - Frontend infra: `package.json`, `tsconfig.json`, `node_modules` in place
   if delegating frontend code.
-- Test files visible to the muscle: paste exact contents in the brief or
-  attach via `-f`. The shim has no tool access.
+- Test files visible to the muscle: attach via `-f` (preferred, file
+  contents bypass brain context). Paste-into-brief only when you need the
+  contents in your own context anyway. The shim has no tool access.
 - Spec review: count files asked vs files described before sending.
 
 ## Reporting to the user
