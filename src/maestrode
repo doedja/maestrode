@@ -215,7 +215,13 @@ RESP_FILE=$(mktemp -t maestrode_resp.XXXXXX)
 trap 'rm -f "$PROMPT_FILE" "$PAYLOAD_FILE" "$RESP_FILE"' EXIT
 
 {
-  if [[ ! -t 0 ]]; then
+  # Only read stdin when it is a real piped/redirected/heredoc input. A bare
+  # `[[ ! -t 0 ]]` matches Claude Code's Bash tool, which hands the child a
+  # unix-socket stdin that never closes; `cat` would block until the tool
+  # killed it (SIGKILL skips the EXIT trap, leaving 0-byte temps and no
+  # usage-log write). FIFOs (echo x | ...) and regular files (< file or
+  # heredocs that bash backs with a temp file) cover all real-input modes.
+  if [[ -p /dev/stdin || -f /dev/stdin ]]; then
     cat
     printf '\n\n'
   fi

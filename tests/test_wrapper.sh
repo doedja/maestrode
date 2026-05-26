@@ -54,6 +54,46 @@ code=$?
 set -e
 [[ $code -eq 64 ]] && ok "exit 64 on empty" || ko "wrong exit: $code"
 
+echo "== test 5b: never-closing unix-socket stdin does not hang =="
+# Reproduces the Claude Code Bash tool case: child inherits a unix socket
+# as stdin whose other end is held open but never written to. The old
+# `[[ ! -t 0 ]]` gate let `cat` block forever; the harness then SIGKILLs
+# the script, EXIT trap never fires, 0-byte temps + no log write pile up.
+# The new gate (`-p` || `-f`) rejects sockets, so cat is skipped.
+# Watchdog rolled by hand because GNU `timeout` is not on stock macOS.
+set +e
+python3 - "$MAESTRODE" >/dev/null 2>&1 <<'PY' &
+import os, socket, sys, time
+a, b = socket.socketpair()
+pid = os.fork()
+if pid == 0:
+    # child: keep `a` open silently so the parent's stdin never closes.
+    b.close()
+    time.sleep(10)
+    sys.exit(0)
+# parent: dup the other socket end onto stdin and exec maestrode.
+a.close()
+os.dup2(b.fileno(), 0)
+os.execvp(sys.argv[1], [sys.argv[1], "--dry-run", "socket stdin task"])
+PY
+M_PID=$!
+( sleep 3; kill -9 "$M_PID" 2>/dev/null ) &
+WATCHDOG=$!
+wait "$M_PID"
+code=$?
+set -e
+kill "$WATCHDOG" 2>/dev/null || true
+wait "$WATCHDOG" 2>/dev/null || true
+# Reap any stray socket-holder children python forked.
+pkill -P "$$" -f "socket.socketpair" 2>/dev/null || true
+if [[ $code -eq 137 || $code -eq 143 ]]; then
+  ko "hung on never-closing socket (watchdog had to SIGKILL it)"
+elif [[ $code -eq 0 ]]; then
+  ok "completed without hanging on never-closing socket"
+else
+  ko "unexpected exit on socket stdin: $code"
+fi
+
 echo "== test 6: missing -f file rejected =="
 set +e
 "$MAESTRODE" --dry-run -f /nonexistent/path/xxx "task" >/dev/null 2>&1

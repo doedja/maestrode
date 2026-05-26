@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+Hang fix:
+
+- **Stdin gate hardened.** The shim's `[[ ! -t 0 ]]` check matched any
+  non-tty fd, including the unix socket Claude Code's Bash tool hands
+  child processes. `cat` would block on a peer that never closes, the
+  harness eventually SIGKILL'd the script, the EXIT trap never fired,
+  0-byte temp files and zero usage-log writes piled up. Replaced with
+  `[[ -p /dev/stdin || -f /dev/stdin ]]` so cat runs only for true FIFOs
+  (`echo x | maestrode`), regular files (`maestrode < file`), and
+  heredocs (bash backs them with a temp file). Regression test
+  reproduces the socket case via Python `socketpair`.
+
 Feedback-loop improvements (lessons borrowed from Reasonix's Pillar 3):
 
 - **`<<<NEEDS_SMART>>>` self-escalation.** The muscle can refuse a brief
@@ -48,7 +60,7 @@ Install:
   Uninstall reverses both. Opt out with `MAESTRODE_NO_HOOK=1`; override
   paths with `MAESTRODE_HOOK_DIR` / `MAESTRODE_SETTINGS_FILE`.
 
-13 new test cases (total 36, all passing, still no network).
+14 new test cases (total 37, all passing, still no network).
 
 ## v0.1.0 (initial release)
 
