@@ -13,6 +13,7 @@
 #   maestrode --session arm-b --system "You are a senior engineer." "follow-up turn"
 #   maestrode --full "include reasoning trace"
 #   maestrode --model gpt-5.1-codex "swap model"
+#   maestrode gain                 show aggregate usage stats from the local log
 #
 # flags:
 #   --session NAME    persist multi-turn at ~/.config/maestrode/sessions/NAME.json
@@ -56,11 +57,115 @@ set -euo pipefail
 
 CONFIG_DIR="${MAESTRODE_CONFIG_DIR:-${HOME}/.config/maestrode}"
 ENV_FILE="${CONFIG_DIR}/env"
+USAGE_LOG="${CONFIG_DIR}/usage.jsonl"
 if [[ -f "$ENV_FILE" ]]; then
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+fi
+
+# Subcommand: `maestrode gain` prints aggregate stats from the usage log.
+# No API key needed for this path.
+if [[ "${1:-}" == "gain" ]]; then
+  shift
+  USAGE_LOG="$USAGE_LOG" python3 - "$@" <<'PY'
+import json, os, sys, datetime, pathlib
+
+log = pathlib.Path(os.environ["USAGE_LOG"])
+if not log.exists() or log.stat().st_size == 0:
+    print("maestrode gain: no usage logged yet at", log)
+    print("(usage logs are appended after each successful call)")
+    sys.exit(0)
+
+rows = []
+for line in log.read_text().splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rows.append(json.loads(line))
+    except json.JSONDecodeError:
+        continue
+
+if not rows:
+    print("maestrode gain: usage log exists but no valid entries")
+    sys.exit(0)
+
+def human(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.0f}k"
+    return str(n)
+
+def hms(s: float) -> str:
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s"
+
+first_ts = min(r.get("ts", "") for r in rows if r.get("ts"))
+last_ts  = max(r.get("ts", "") for r in rows if r.get("ts"))
+def parse_ts(s):
+    try:
+        return datetime.datetime.fromisoformat(s)
+    except Exception:
+        return None
+first_dt, last_dt = parse_ts(first_ts), parse_ts(last_ts)
+span_days = ""
+if first_dt and last_dt:
+    days = max(1, (last_dt - first_dt).days + 1)
+    span_days = f" ({days} day{'s' if days != 1 else ''})"
+
+total_calls = len(rows)
+total_prompt = sum(r.get("prompt", 0) for r in rows)
+total_out    = sum(r.get("out", 0) for r in rows)
+total_reason = sum(r.get("reason", 0) for r in rows)
+total_wall   = sum(r.get("wall", 0) for r in rows)
+
+by_model = {}
+for r in rows:
+    m = r.get("model", "?")
+    d = by_model.setdefault(m, {"calls": 0, "tokens": 0})
+    d["calls"]  += 1
+    d["tokens"] += r.get("prompt", 0) + r.get("out", 0) + r.get("reason", 0)
+
+by_exit = {}
+for r in rows:
+    code = r.get("exit", 0)
+    label = {0: "ok", 5: "NEEDS_SMART", 3: "rate-limit (429)", 2: "api error", 4: "no blocks parsed"}.get(code, f"exit {code}")
+    by_exit[label] = by_exit.get(label, 0) + 1
+
+total_tokens = total_prompt + total_out + total_reason
+date_label = first_dt.date().isoformat() if first_dt else "?"
+
+print()
+print("maestrode gain")
+print(f"  since {date_label}{span_days} ({total_calls} call{'s' if total_calls != 1 else ''})")
+print()
+print(f"  muscle handled:")
+print(f"    {human(total_tokens)} tokens  ({human(total_prompt)} prompt / {human(total_out)} output / {human(total_reason)} reasoning)")
+print()
+print(f"  by model:")
+for m, d in sorted(by_model.items(), key=lambda kv: -kv[1]["tokens"]):
+    print(f"    {m:<22} {d['calls']:>3} calls  {human(d['tokens']):>6} tokens")
+print()
+if len(by_exit) > 1 or "ok" not in by_exit:
+    print(f"  by exit:")
+    for label, count in sorted(by_exit.items(), key=lambda kv: -kv[1]):
+        print(f"    {label:<22} {count}")
+    print()
+avg = total_wall / total_calls if total_calls else 0
+print(f"  wall time: {hms(total_wall)} total (avg {hms(avg)}/call)")
+print()
+sys.exit(0)
+PY
+  exit $?
 fi
 
 : "${MAESTRODE_API_KEY:?set MAESTRODE_API_KEY in ${ENV_FILE} or env}"
@@ -252,6 +357,8 @@ if [[ "${MAESTRODE_NO_RETRY:-0}" == "1" ]]; then
   MAX_RETRIES=0
 fi
 
+CALL_T0=$(python3 -c 'import time; print(time.time())')
+
 attempt=0
 backoff=2
 HTTP_CODE=""
@@ -291,6 +398,7 @@ fi
 
 FULL="$FULL" RAW="$RAW" FILES_DIR="$FILES_DIR" \
 PROMPT_FILE="$PROMPT_FILE" SESSION_FILE="$SESSION_FILE" \
+USAGE_LOG="$USAGE_LOG" CALL_T0="$CALL_T0" \
 python3 - "$RESP_FILE" <<'PY'
 import json, os, sys, re, pathlib
 
@@ -325,6 +433,34 @@ if esc:
     why = (esc.group(1) or "").strip() or "(no reason given)"
     sys.stderr.write(f"maestrode: muscle escalated. reason: {why}\n")
     sys.stderr.write("hint: handle this turn with the smart model directly.\n")
+    # Log the escalation so `maestrode gain` reflects it.
+    usage_log = os.environ.get("USAGE_LOG") or ""
+    if usage_log:
+        import datetime, time
+        u = resp.get("usage") or {}
+        ct = u.get("completion_tokens") or 0
+        rt_ = (u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+        pt_ = u.get("prompt_tokens") or 0
+        out_ = ct - rt_ if isinstance(ct, int) else 0
+        hit_ = u.get("prompt_cache_hit_tokens", 0)
+        miss_ = u.get("prompt_cache_miss_tokens", 0)
+        t0 = float(os.environ.get("CALL_T0") or 0) or time.time()
+        wall = max(0.0, time.time() - t0)
+        record = {
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+            "model": resp.get("model") or "",
+            "prompt": pt_, "out": out_, "reason": rt_,
+            "cache_hit": hit_, "cache_miss": miss_,
+            "finish": choice.get("finish_reason") or "stop",
+            "wall": round(wall, 2), "files": 0, "exit": 5,
+        }
+        try:
+            log_path = pathlib.Path(usage_log)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            pass
     sys.exit(5)
 
 if os.environ.get("RAW") != "1":
@@ -410,4 +546,31 @@ if files_written:
     sys.stderr.write(f"[maestrode wrote {len(files_written)} files to {files_dir}]\n")
     for f in files_written:
         sys.stderr.write(f"  + {f}\n")
+
+# Append a usage record to the log so `maestrode gain` can aggregate.
+usage_log = os.environ.get("USAGE_LOG") or ""
+if usage_log:
+    import datetime, time
+    t0 = float(os.environ.get("CALL_T0") or 0) or time.time()
+    wall = max(0.0, time.time() - t0)
+    record = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "model": resp.get("model") or "",
+        "prompt": pt if isinstance(pt, int) else 0,
+        "out": out_t if isinstance(out_t, int) else 0,
+        "reason": rt if isinstance(rt, int) else 0,
+        "cache_hit": hit if isinstance(hit, int) else 0,
+        "cache_miss": miss if isinstance(miss, int) else 0,
+        "finish": finish or "stop",
+        "wall": round(wall, 2),
+        "files": len(files_written),
+        "exit": 0,
+    }
+    try:
+        log_path = pathlib.Path(usage_log)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
 PY
