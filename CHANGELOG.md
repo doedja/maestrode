@@ -25,8 +25,10 @@ Feedback-loop improvements (lessons borrowed from Reasonix's Pillar 3):
 - **Truncation diagnostic.** Detects `finish_reason=length` and unbalanced
   `<<<FILE:>>>` blocks; surfaces clear warnings to stderr. Closed blocks
   still get written so partial progress is recoverable.
-- **Higher defaults.** `MAESTRODE_MAX_TOKENS` 32768 → 65536,
-  `MAESTRODE_CURL_TIMEOUT` 300 → 600.
+- **Higher defaults.** `MAESTRODE_MAX_TOKENS` 32768 → 65536 → 256000,
+  `MAESTRODE_CURL_TIMEOUT` 300 → 600. The 256k bump was verified against
+  OpenCode Zen + deepseek-v4-flash with a tiny call; lower it via env or
+  `--max-tokens` if your endpoint caps shorter.
 - **Parallel-dispatch pattern** documented in skill + README for
   multi-module builds (shell `&` + `wait` with per-session, per-output-dir
   calls).

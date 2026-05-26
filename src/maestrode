@@ -43,7 +43,7 @@
 # env (from ~/.config/maestrode/env or shell):
 #   MAESTRODE_API_KEY        required
 #   MAESTRODE_MODEL          default: deepseek-v4-flash
-#   MAESTRODE_MAX_TOKENS     default: 65536 (raise if your endpoint allows more)
+#   MAESTRODE_MAX_TOKENS     default: 256000 (lower if your endpoint caps shorter)
 #   MAESTRODE_ENDPOINT       default: https://api.deepseek.com/v1/chat/completions
 #   MAESTRODE_CURL_TIMEOUT   default: 600 (seconds)
 #   MAESTRODE_ALLOW_SECRETS  set to 1 to bypass the secret-pattern scan
@@ -171,7 +171,7 @@ fi
 : "${MAESTRODE_API_KEY:?set MAESTRODE_API_KEY in ${ENV_FILE} or env}"
 MODEL="${MAESTRODE_MODEL:-deepseek-v4-flash}"
 ENDPOINT="${MAESTRODE_ENDPOINT:-https://api.deepseek.com/v1/chat/completions}"
-MAX_TOKENS="${MAESTRODE_MAX_TOKENS:-65536}"
+MAX_TOKENS="${MAESTRODE_MAX_TOKENS:-256000}"
 
 FULL=0
 RAW=0
