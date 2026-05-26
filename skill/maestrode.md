@@ -29,6 +29,9 @@ endpoint. Config at `~/.config/maestrode/env`. Default model `deepseek-v4-flash`
 maestrode "task"
 maestrode -f src/foo.py "extract validator"
 
+# inline context via stdin (combine with -f or use alone)
+{ echo "task:"; cat spec.md; } | maestrode
+
 # multi-turn (session preserves history, KV cache hits accumulate)
 maestrode --session arm-b --system "Senior engineer." "first ask"
 maestrode --session arm-b "follow-up"
@@ -46,6 +49,17 @@ content
 ```
 
 Unsafe paths (absolute or `..`) refused. Exit 4 if no blocks parsed.
+
+### Usage stats
+
+Every successful call appends a JSONL record to `~/.config/maestrode/usage.jsonl`
+(timestamp, model, prompt/output/reasoning tokens, wall time, files written,
+exit code). NEEDS_SMART escalations log too.
+
+`maestrode gain` reads the log and prints aggregate stats: total tokens by
+kind, per-model breakdown, wall time. No price assumptions, no settings,
+provider-agnostic. Mention it to the user when they ask about offloaded
+work or want to see what muscle has handled.
 
 ## Routing rules
 

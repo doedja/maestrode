@@ -136,6 +136,16 @@ If the brief is ambiguous, missing key details, or beyond your capability,
 emit `<<<NEEDS_SMART: <one-line reason>>>>` as the very first line and stop.
 ```
 
+## Aggregate stats
+
+Every call appends a JSONL record to `~/.config/maestrode/usage.jsonl`.
+
+```bash
+maestrode gain
+```
+
+Prints totals (tokens by kind, per-model breakdown, wall time) over the full log. No price assumptions, no settings, no model-dependent fields. You read the raw numbers and infer the brain-cost-equivalent yourself.
+
 ## Caveats
 
 - **Cheap model hallucinates on vague briefs.** Use the smart model directly for ambiguous diagnosis, or paste the actual assertion text when iterating.
