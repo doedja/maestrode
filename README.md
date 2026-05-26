@@ -100,31 +100,11 @@ Set `MAESTRODE_API_KEY` and `MAESTRODE_ENDPOINT` in `~/.config/maestrode/env`.
 
 **Stack all three (rtk + caveman + maestrode)** and Claude tokens drop across every layer: shell output (rtk), chat replies (caveman), code drafting (maestrode). No config needed, the skills know how to compose.
 
-## Big jobs
-
-For multi-module builds, split the brief and dispatch in parallel:
-
-```bash
-maestrode --session p-api --files build/api "<api brief>" &
-maestrode --session p-db  --files build/db  "<db brief>"  &
-maestrode --session p-web --files build/web "<web brief>" &
-wait
-```
-
-Each call has its own session (independent cache) and its own output dir. Three parallel ~30s calls finish in ~30s wall, not ~90s, and each stays under `max_tokens`. Defaults: `MAESTRODE_MAX_TOKENS=65536`, `MAESTRODE_CURL_TIMEOUT=600`. Raise both via env if your endpoint supports more.
-
 ## Feedback the shim gives you
 
 - **`finish=length`** in the stderr stat line plus `response cut by max_tokens` warning when the model hit the cap. Raise `--max-tokens` (or split the brief).
 - **`N <<<FILE:>>> block(s) opened but not closed`** when `--files` parsing finds a truncated response. Closed blocks still get written; reissue the missing ones.
 - **Exit 5 (`NEEDS_SMART`)** when the cheap muscle decides the brief is too thin or the task exceeds its capability. Session + file writes are skipped. The brain takes over.
-
-Teach the muscle the escalation contract via `--system`:
-
-```text
-If the brief is ambiguous, missing key details, or beyond your capability,
-emit `<<<NEEDS_SMART: <one-line reason>>>>` as the very first line and stop.
-```
 
 ## Aggregate stats
 
