@@ -19,6 +19,21 @@ Feedback-loop improvements (lessons borrowed from Reasonix's Pillar 3):
   multi-module builds (shell `&` + `wait` with per-session, per-output-dir
   calls).
 
+Skill (so the mode stops silently fading mid-session):
+
+- **Per-turn footer tag.** Every assistant turn ends with
+  `[maestrode: delegated <files>]` or `[maestrode: direct: <reason>]`.
+  Continuous self-trigger that re-instantiates the rule on every reply,
+  the same mechanism that makes caveman stick.
+- **State file + PreToolUse hook.** Activation touches
+  `~/.config/maestrode/active`. An installer-dropped hook at
+  `~/.claude/hooks/maestrode-reminder.sh` fires soft reminders on
+  direct Edit/Write while the file exists. No block.
+- **Slimmer body.** SKILL.md trimmed from 350 to 200 lines. Front-loaded
+  the one-line delegation rule; killed the `-f` vs Read branching in
+  favor of "default `-f`". Calibration detail (bench numbers, KV cache,
+  pre-checks) moved to personal refs.
+
 Install:
 
 - **Windows native installer (`install.ps1`).** Mirrors `install.sh`,
@@ -27,6 +42,11 @@ Install:
   (`bash.exe`) and Python 3 at runtime.
 - **`--uninstall` flag** on both installers (`--keep-config` to preserve
   the env file).
+- **Hook wiring.** `install.sh` and `install.ps1` copy
+  `hooks/maestrode-reminder.sh` to `~/.claude/hooks/` and idempotently
+  patch `~/.claude/settings.json` to register the PreToolUse entry.
+  Uninstall reverses both. Opt out with `MAESTRODE_NO_HOOK=1`; override
+  paths with `MAESTRODE_HOOK_DIR` / `MAESTRODE_SETTINGS_FILE`.
 
 13 new test cases (total 36, all passing, still no network).
 
