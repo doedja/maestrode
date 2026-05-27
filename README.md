@@ -49,7 +49,7 @@ nvim ~/.config/maestrode/env
 notepad $env:USERPROFILE\.config\maestrode\env
 ```
 
-Uninstall (removes binary + config + sessions + Claude skill + hook):
+Uninstall (removes binary + config + sessions + Claude skill, and scrubs any legacy hook left over from earlier versions):
 
 ```bash
 # macOS / Linux / WSL

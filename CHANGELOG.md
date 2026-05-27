@@ -39,10 +39,16 @@ Skill (so the mode stops silently fading mid-session):
   `[maestrode: delegated <files>]` or `[maestrode: direct: <reason>]`.
   Continuous self-trigger that re-instantiates the rule on every reply,
   the same mechanism that makes caveman stick.
-- **State file + PreToolUse hook.** Activation touches
-  `~/.config/maestrode/active`. An installer-dropped hook at
-  `~/.claude/hooks/maestrode-reminder.sh` fires soft reminders on
-  direct Edit/Write while the file exists. No block.
+- **State file + PreToolUse hook removed.** The earlier design wrote
+  `~/.config/maestrode/active` on activation and registered a
+  PreToolUse reminder hook. Sessions that ended without "maestrode off"
+  (crash, /clear, terminal close) left the sentinel behind, and every
+  future Claude Code session saw the reminder fire on the first
+  Edit/Write, making the mode feel "on" when the user never enabled
+  it. Mode now lives entirely in the conversation: skill description
+  + per-turn footer tag, no global filesystem state. The installer
+  removes the legacy sentinel, hook script, and `settings.json` entry
+  on the next run so existing users self-heal.
 - **Slimmer body.** SKILL.md trimmed from 350 to 200 lines. Front-loaded
   the one-line delegation rule; killed the `-f` vs Read branching in
   favor of "default `-f`". Calibration detail (bench numbers, KV cache,
@@ -56,11 +62,13 @@ Install:
   (`bash.exe`) and Python 3 at runtime.
 - **`--uninstall` flag** on both installers (`--keep-config` to preserve
   the env file).
-- **Hook wiring.** `install.sh` and `install.ps1` copy
-  `hooks/maestrode-reminder.sh` to `~/.claude/hooks/` and idempotently
-  patch `~/.claude/settings.json` to register the PreToolUse entry.
-  Uninstall reverses both. Opt out with `MAESTRODE_NO_HOOK=1`; override
-  paths with `MAESTRODE_HOOK_DIR` / `MAESTRODE_SETTINGS_FILE`.
+- **Hook wiring removed; legacy cleanup added.** `install.sh` and
+  `install.ps1` no longer install any PreToolUse / SessionStart hook
+  (see "State file + PreToolUse hook removed" above). Every install
+  and uninstall now also scrubs any prior-version hook script,
+  `settings.json` entry, and `~/.config/maestrode/active` sentinel.
+  `MAESTRODE_NO_HOOK` is now ignored (kept reserved); `MAESTRODE_HOOK_DIR`
+  still selects the cleanup target for non-default layouts.
 
 14 new test cases (total 37, all passing, still no network).
 

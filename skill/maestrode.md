@@ -20,26 +20,16 @@ the user said do it yourself, or an architecture / security call the
 brain must own. If your next tool call is Edit or Write and none of those
 apply, you skipped a delegation.
 
-State: **on** after "maestrode on" / "use maestrode" / invoke this skill.
-**off** after "maestrode off" / "normal mode".
+State lives in this conversation only. **On** after "maestrode on" /
+"use maestrode" / invoke this skill. **Off** after "maestrode off" /
+"normal mode" / new session. There is no on-disk flag and no hook; the
+mode is whatever the footer tag below says it is.
 
-## State file (external reminder)
-
-Activation also writes a state file so a PreToolUse hook can remind brain
-on every direct Edit/Write while the mode is on. Run on activation:
-
-    mkdir -p ~/.config/maestrode && touch ~/.config/maestrode/active
-
-On deactivation:
-
-    rm -f ~/.config/maestrode/active
-
-The hook (`~/.claude/hooks/maestrode-reminder.sh`) is wired in
-`~/.claude/settings.json` under PreToolUse with matcher
-`Edit|Write|MultiEdit|NotebookEdit`. When the state file exists, the hook
-emits an `additionalContext` reminder on every Edit/Write attempt. When
-the file is absent the hook is a no-op. The reminder is soft (no block);
-it just keeps the mode visible to the brain across long sessions.
+Earlier versions wrote `~/.config/maestrode/active` and ran a PreToolUse
+reminder hook. That state was global and outlived sessions, so a session
+that ended without "maestrode off" leaked the mode into every future
+session. The installer self-heals: any prior hook entry, hook script,
+and sentinel file are removed on the next `./install.sh` run.
 
 ## Required per-turn footer tag (keeps the mode live)
 

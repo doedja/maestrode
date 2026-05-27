@@ -4,15 +4,23 @@
 # Idempotent: safe to re-run.
 #
 # Also drops the Claude Code skill at %USERPROFILE%\.claude\skills\maestrode\SKILL.md
-# and a PreToolUse reminder hook at %USERPROFILE%\.claude\hooks\maestrode-reminder.sh
-# (registered in %USERPROFILE%\.claude\settings.json) when ~/.claude exists.
-#   Set $env:MAESTRODE_NO_SKILL=1 / $env:MAESTRODE_NO_HOOK=1 to skip either.
+# when ~/.claude exists. The skill carries the per-turn footer-tag rule
+# that keeps mode visible across turns; no filesystem state, no hooks.
+#   Set $env:MAESTRODE_NO_SKILL=1 to skip the skill.
 #   Override paths with $env:MAESTRODE_SKILL_DIR / $env:MAESTRODE_HOOK_DIR /
 #   $env:MAESTRODE_SETTINGS_FILE.
 #
+# Every install also runs a one-time cleanup of the legacy PreToolUse
+# reminder hook (and the short-lived SessionStart cleanup hook) plus the
+# old %USERPROFILE%\.config\maestrode\active sentinel. Those were removed
+# because the sentinel was global filesystem state masquerading as session
+# state; session-end without "maestrode off" leaked it into future
+# sessions and triggered the reminder when the user never activated the
+# mode. Mode now lives entirely in the conversation.
+#
 # uninstall:
-#   .\install.ps1 -Uninstall                (remove binary + config + sessions + skill + hook)
-#   .\install.ps1 -Uninstall -KeepConfig    (remove binary + skill + hook only)
+#   .\install.ps1 -Uninstall                (remove binary + config + sessions + skill + legacy hooks)
+#   .\install.ps1 -Uninstall -KeepConfig    (remove binary + skill + legacy hooks only)
 #
 # requires:
 #   - Git for Windows (provides bash.exe). Install: winget install Git.Git
@@ -46,69 +54,79 @@ $SettingsFile = if ($env:MAESTRODE_SETTINGS_FILE) { $env:MAESTRODE_SETTINGS_FILE
 $ClaudeRoot = "$env:USERPROFILE\.claude"
 $RawBase = "https://raw.githubusercontent.com/$Repo/$Branch"
 
-# Locate python once for settings.json patching (used in both install and uninstall).
+# Names of hooks from prior versions that this installer cleans up.
+$LegacyHookNames = @('maestrode-reminder.sh', 'maestrode-session-clear.sh')
+
+# Locate python once for settings.json patching (used by the cleanup step).
 $PyCmd = Get-Command python3 -ErrorAction SilentlyContinue
 if (-not $PyCmd) { $PyCmd = Get-Command python -ErrorAction SilentlyContinue }
 
-$PySettingsInstall = @'
+# Python program that strips legacy hook entries from settings.json.
+# Args: settings_path hook_dir name1 name2 ...
+$PySettingsCleanup = @'
 import json, os, sys
-settings_path, hook_cmd = sys.argv[1], sys.argv[2]
-matcher = "Edit|Write|MultiEdit|NotebookEdit"
-if os.path.exists(settings_path):
-    try:
-        with open(settings_path) as f:
-            d = json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"warn: {settings_path} is not valid JSON, skipping hook registration: {e}", file=sys.stderr)
-        sys.exit(0)
-else:
-    d = {}
-hooks = d.setdefault("hooks", {})
-pre = hooks.setdefault("PreToolUse", [])
-already = any(
-    any(hh.get("command") == hook_cmd for hh in entry.get("hooks", []))
-    for entry in pre
-)
-if already:
-    sys.exit(0)
-pre.append({
-    "matcher": matcher,
-    "hooks": [{"type": "command", "command": hook_cmd}]
-})
-os.makedirs(os.path.dirname(settings_path) or ".", exist_ok=True)
-with open(settings_path, "w") as f:
-    json.dump(d, f, indent=2)
-    f.write("\n")
-print(f"registered hook in {settings_path}")
-'@
-
-$PySettingsUninstall = @'
-import json, os, sys
-settings_path, hook_cmd = sys.argv[1], sys.argv[2]
+settings_path = sys.argv[1]
+hook_dir = sys.argv[2]
+names = sys.argv[3:]
+legacy_cmds = {os.path.join(hook_dir, n) for n in names}
 try:
     with open(settings_path) as f:
         d = json.load(f)
 except (json.JSONDecodeError, OSError):
     sys.exit(0)
-pre = d.get("hooks", {}).get("PreToolUse", [])
-new_pre = []
+hooks = d.get("hooks") or {}
 changed = False
-for entry in pre:
-    orig = entry.get("hooks", [])
-    kept = [hh for hh in orig if hh.get("command") != hook_cmd]
-    if len(kept) != len(orig):
-        changed = True
-    if kept:
-        e = dict(entry)
-        e["hooks"] = kept
-        new_pre.append(e)
+for event in ("PreToolUse", "SessionStart", "PostToolUse", "Stop", "UserPromptSubmit"):
+    entries = hooks.get(event, [])
+    new_entries = []
+    for entry in entries:
+        orig = entry.get("hooks", [])
+        kept = [hh for hh in orig if hh.get("command") not in legacy_cmds]
+        if len(kept) != len(orig):
+            changed = True
+        if kept:
+            e = dict(entry)
+            e["hooks"] = kept
+            new_entries.append(e)
+    if entries != new_entries:
+        hooks[event] = new_entries
+        if not new_entries:
+            del hooks[event]
 if changed:
-    d["hooks"]["PreToolUse"] = new_pre
+    if hooks:
+        d["hooks"] = hooks
+    else:
+        d.pop("hooks", None)
     with open(settings_path, "w") as f:
         json.dump(d, f, indent=2)
         f.write("\n")
-    print(f"removed hook entry from {settings_path}")
+    print(f"removed legacy hook entries from {settings_path}")
 '@
+
+function Remove-LegacyHooks {
+    foreach ($name in $LegacyHookNames) {
+        $path = Join-Path $HookDir $name
+        if (Test-Path $path) {
+            Remove-Item -Force $path
+            Write-Host "removed legacy hook $path"
+        }
+    }
+    if ((Test-Path $HookDir) -and -not (Get-ChildItem -Force $HookDir)) {
+        Remove-Item -Force $HookDir
+    }
+    if ((Test-Path $SettingsFile) -and $PyCmd) {
+        $args = @($SettingsFile, $HookDir) + $LegacyHookNames
+        $PySettingsCleanup | & $PyCmd.Source - @args
+    }
+}
+
+function Remove-LegacySentinel {
+    $sentinel = Join-Path $ConfigDir 'active'
+    if (Test-Path $sentinel) {
+        Remove-Item -Force $sentinel
+        Write-Host "removed legacy sentinel $sentinel"
+    }
+}
 
 function Remove-PathEntry {
     param([string]$Dir)
@@ -148,18 +166,8 @@ if ($Uninstall) {
         Write-Host "removed $skillFile"
         $removed = $true
     }
-    $hookFile = Join-Path $HookDir 'maestrode-reminder.sh'
-    if (Test-Path $hookFile) {
-        Remove-Item -Force $hookFile
-        if ((Test-Path $HookDir) -and -not (Get-ChildItem -Force $HookDir)) {
-            Remove-Item -Force $HookDir
-        }
-        Write-Host "removed $hookFile"
-        $removed = $true
-    }
-    if ((Test-Path $SettingsFile) -and $PyCmd) {
-        $PySettingsUninstall | & $PyCmd.Source - $SettingsFile $hookFile
-    }
+    Remove-LegacyHooks
+    Remove-LegacySentinel
     if (-not $KeepConfig -and (Test-Path $ConfigDir)) {
         Remove-Item -Recurse -Force $ConfigDir
         Write-Host "removed $ConfigDir"
@@ -194,6 +202,10 @@ if (-not $py) {
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ConfigDir  | Out-Null
+
+# Self-heal any prior-version state before the rest of install runs.
+Remove-LegacyHooks
+Remove-LegacySentinel
 
 # Prefer local clone source if present
 $ScriptDir = $null
@@ -247,34 +259,6 @@ if ($env:MAESTRODE_NO_SKILL -ne '1' -and ((Test-Path $ClaudeRoot) -or $env:MAEST
         } catch {
             Write-Warning "could not download skill from $RawBase/skill/maestrode.md: $_"
         }
-    }
-}
-
-# PreToolUse reminder hook. Fires on Edit/Write while ~/.config/maestrode/active
-# exists, nudging brain to either delegate or tag the turn. Soft, no block.
-if ($env:MAESTRODE_NO_HOOK -ne '1' -and ((Test-Path $ClaudeRoot) -or $env:MAESTRODE_HOOK_DIR)) {
-    New-Item -ItemType Directory -Force -Path $HookDir | Out-Null
-    $hookTarget = Join-Path $HookDir 'maestrode-reminder.sh'
-    $localHook = $null
-    if ($ScriptDir) {
-        $candidate = Join-Path $ScriptDir 'hooks\maestrode-reminder.sh'
-        if (Test-Path $candidate) { $localHook = $candidate }
-    }
-    if ($localHook) {
-        Copy-Item -Force $localHook $hookTarget
-        Write-Host "synced hook from $localHook -> $hookTarget"
-    } else {
-        try {
-            Invoke-WebRequest -Uri "$RawBase/hooks/maestrode-reminder.sh" -OutFile $hookTarget -UseBasicParsing
-            Write-Host "synced hook -> $hookTarget"
-        } catch {
-            Write-Warning "could not download hook from $RawBase/hooks/maestrode-reminder.sh: $_"
-        }
-    }
-    if ($PyCmd) {
-        $PySettingsInstall | & $PyCmd.Source - $SettingsFile $hookTarget
-    } else {
-        Write-Warning "python not on PATH; add the PreToolUse entry to $SettingsFile by hand."
     }
 }
 

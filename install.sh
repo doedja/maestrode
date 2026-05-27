@@ -5,15 +5,23 @@
 # Idempotent: safe to re-run.
 #
 # Also drops the Claude Code skill at ~/.claude/skills/maestrode/SKILL.md
-# and a PreToolUse reminder hook at ~/.claude/hooks/maestrode-reminder.sh
-# (registered in ~/.claude/settings.json) when ~/.claude exists.
-#   Set MAESTRODE_NO_SKILL=1 / MAESTRODE_NO_HOOK=1 to skip either.
+# when ~/.claude exists. The skill carries the per-turn footer-tag rule
+# that keeps mode visible across turns; no filesystem state, no hooks.
+#   Set MAESTRODE_NO_SKILL=1 to skip the skill.
 #   Override paths with MAESTRODE_SKILL_DIR / MAESTRODE_HOOK_DIR /
 #   MAESTRODE_SETTINGS_FILE.
 #
+# Every install also runs a one-time cleanup of the legacy PreToolUse
+# reminder hook (and the short-lived SessionStart cleanup hook) plus the
+# old ~/.config/maestrode/active sentinel. Those were removed because the
+# sentinel was global filesystem state masquerading as session state;
+# session-end without "maestrode off" leaked it into future sessions and
+# triggered the reminder when the user never activated the mode. Mode now
+# lives entirely in the conversation: skill description + footer tag.
+#
 # uninstall:
-#   ./install.sh --uninstall            (remove binary + config + sessions + skill + hook)
-#   ./install.sh --uninstall --keep-config   (remove binary + skill + hook only)
+#   ./install.sh --uninstall            (remove binary + config + sessions + skill + legacy hooks)
+#   ./install.sh --uninstall --keep-config   (remove binary + skill + legacy hooks only)
 #   curl -fsSL .../install.sh | bash -s -- --uninstall
 
 set -euo pipefail
@@ -28,6 +36,79 @@ SETTINGS_FILE="${MAESTRODE_SETTINGS_FILE:-${HOME}/.claude/settings.json}"
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 
+# Names of hooks from prior versions that this installer cleans up.
+LEGACY_HOOK_NAMES=("maestrode-reminder.sh" "maestrode-session-clear.sh")
+
+# cleanup_legacy_hooks: remove any prior-version hook scripts and strip
+# their entries from settings.json. Called on both install and uninstall.
+# Reports what it removed so the cleanup is visible. Returns 0 always;
+# nothing here should block install.
+cleanup_legacy_hooks() {
+  local removed_any=0
+  for name in "${LEGACY_HOOK_NAMES[@]}"; do
+    local path="${HOOK_DIR}/${name}"
+    if [[ -e "$path" ]]; then
+      rm -f "$path"
+      echo "removed legacy hook ${path}"
+      removed_any=1
+    fi
+  done
+  rmdir "$HOOK_DIR" 2>/dev/null || true
+  if [[ -f "$SETTINGS_FILE" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$SETTINGS_FILE" "$HOOK_DIR" "${LEGACY_HOOK_NAMES[@]}" <<'PY'
+import json, os, sys
+settings_path = sys.argv[1]
+hook_dir = sys.argv[2]
+names = sys.argv[3:]
+legacy_cmds = {os.path.join(hook_dir, n) for n in names}
+try:
+    with open(settings_path) as f:
+        d = json.load(f)
+except (json.JSONDecodeError, OSError):
+    sys.exit(0)
+hooks = d.get("hooks") or {}
+changed = False
+for event in ("PreToolUse", "SessionStart", "PostToolUse", "Stop", "UserPromptSubmit"):
+    entries = hooks.get(event, [])
+    new_entries = []
+    for entry in entries:
+        orig = entry.get("hooks", [])
+        kept = [hh for hh in orig if hh.get("command") not in legacy_cmds]
+        if len(kept) != len(orig):
+            changed = True
+        if kept:
+            e = dict(entry)
+            e["hooks"] = kept
+            new_entries.append(e)
+    if entries != new_entries:
+        hooks[event] = new_entries
+        if not new_entries:
+            del hooks[event]
+if changed:
+    if hooks:
+        d["hooks"] = hooks
+    else:
+        d.pop("hooks", None)
+    with open(settings_path, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    print(f"removed legacy hook entries from {settings_path}")
+PY
+    removed_any=1
+  fi
+  return 0
+}
+
+# cleanup_legacy_sentinel: remove the old ~/.config/maestrode/active file
+# left behind by prior-version sessions that ended without "maestrode off".
+# No-op when absent.
+cleanup_legacy_sentinel() {
+  if [[ -e "${CONFIG_DIR}/active" ]]; then
+    rm -f "${CONFIG_DIR}/active"
+    echo "removed legacy sentinel ${CONFIG_DIR}/active"
+  fi
+}
+
 ACTION="install"
 KEEP_CONFIG=0
 for arg in "$@"; do
@@ -35,7 +116,7 @@ for arg in "$@"; do
     --uninstall)    ACTION="uninstall" ;;
     --keep-config)  KEEP_CONFIG=1 ;;
     -h|--help)
-      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "install.sh: unknown flag $arg" >&2; exit 64 ;;
   esac
@@ -56,42 +137,8 @@ if [[ "$ACTION" == "uninstall" ]]; then
     echo "removed $SKILL_FILE"
     removed=1
   fi
-  HOOK_FILE="$HOOK_DIR/maestrode-reminder.sh"
-  if [[ -e "$HOOK_FILE" ]]; then
-    rm -f "$HOOK_FILE"
-    rmdir "$HOOK_DIR" 2>/dev/null || true
-    echo "removed $HOOK_FILE"
-    removed=1
-  fi
-  if [[ -f "$SETTINGS_FILE" ]] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$SETTINGS_FILE" "$HOOK_FILE" <<'PY'
-import json, os, sys
-settings_path, hook_cmd = sys.argv[1], sys.argv[2]
-try:
-    with open(settings_path) as f:
-        d = json.load(f)
-except (json.JSONDecodeError, OSError):
-    sys.exit(0)
-pre = d.get("hooks", {}).get("PreToolUse", [])
-new_pre = []
-changed = False
-for entry in pre:
-    orig = entry.get("hooks", [])
-    kept = [hh for hh in orig if hh.get("command") != hook_cmd]
-    if len(kept) != len(orig):
-        changed = True
-    if kept:
-        e = dict(entry)
-        e["hooks"] = kept
-        new_pre.append(e)
-if changed:
-    d["hooks"]["PreToolUse"] = new_pre
-    with open(settings_path, "w") as f:
-        json.dump(d, f, indent=2)
-        f.write("\n")
-    print(f"removed hook entry from {settings_path}")
-PY
-  fi
+  cleanup_legacy_hooks
+  cleanup_legacy_sentinel
   if [[ $KEEP_CONFIG -eq 0 ]] && [[ -d "$CONFIG_DIR" ]]; then
     rm -rf "$CONFIG_DIR"
     echo "removed $CONFIG_DIR"
@@ -110,6 +157,10 @@ PY
 fi
 
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
+
+# Self-heal any prior-version state before the rest of install runs.
+cleanup_legacy_hooks
+cleanup_legacy_sentinel
 
 # Prefer local src/maestrode (when run from clone). Fall back to download.
 LOCAL_SRC=""
@@ -162,67 +213,6 @@ if [[ "${MAESTRODE_NO_SKILL:-0}" != "1" ]] && [[ -d "${HOME}/.claude" || -n "${M
       echo "warn: could not download skill from ${RAW_BASE}/skill/maestrode.md" >&2
     fi
     rm -f "$SKILL_TMP"
-  fi
-fi
-
-# PreToolUse reminder hook. Fires on Edit/Write while ~/.config/maestrode/active
-# exists, nudging brain to either delegate or tag the turn. Soft, no block.
-# Override: MAESTRODE_NO_HOOK=1 to skip, MAESTRODE_HOOK_DIR / MAESTRODE_SETTINGS_FILE to relocate.
-if [[ "${MAESTRODE_NO_HOOK:-0}" != "1" ]] && [[ -d "${HOME}/.claude" || -n "${MAESTRODE_HOOK_DIR:-}" ]]; then
-  LOCAL_HOOK=""
-  if [[ -n "${SCRIPT_DIR:-}" ]] && [[ -f "${SCRIPT_DIR}/hooks/maestrode-reminder.sh" ]]; then
-    LOCAL_HOOK="${SCRIPT_DIR}/hooks/maestrode-reminder.sh"
-  fi
-  mkdir -p "$HOOK_DIR"
-  HOOK_TARGET="${HOOK_DIR}/maestrode-reminder.sh"
-  if [[ -n "$LOCAL_HOOK" ]]; then
-    install -m 0755 "$LOCAL_HOOK" "$HOOK_TARGET"
-    echo "synced hook from ${LOCAL_HOOK} -> ${HOOK_TARGET}"
-  else
-    HOOK_TMP=$(mktemp)
-    if curl -fsSL "${RAW_BASE}/hooks/maestrode-reminder.sh" -o "$HOOK_TMP"; then
-      install -m 0755 "$HOOK_TMP" "$HOOK_TARGET"
-      echo "synced hook -> ${HOOK_TARGET}"
-    else
-      echo "warn: could not download hook from ${RAW_BASE}/hooks/maestrode-reminder.sh" >&2
-    fi
-    rm -f "$HOOK_TMP"
-  fi
-  # Idempotent settings.json registration.
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$SETTINGS_FILE" "$HOOK_TARGET" <<'PY'
-import json, os, sys
-settings_path, hook_cmd = sys.argv[1], sys.argv[2]
-matcher = "Edit|Write|MultiEdit|NotebookEdit"
-if os.path.exists(settings_path):
-    try:
-        with open(settings_path) as f:
-            d = json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"warn: {settings_path} is not valid JSON, skipping hook registration: {e}", file=sys.stderr)
-        sys.exit(0)
-else:
-    d = {}
-hooks = d.setdefault("hooks", {})
-pre = hooks.setdefault("PreToolUse", [])
-already = any(
-    any(hh.get("command") == hook_cmd for hh in entry.get("hooks", []))
-    for entry in pre
-)
-if already:
-    sys.exit(0)
-pre.append({
-    "matcher": matcher,
-    "hooks": [{"type": "command", "command": hook_cmd}]
-})
-os.makedirs(os.path.dirname(settings_path) or ".", exist_ok=True)
-with open(settings_path, "w") as f:
-    json.dump(d, f, indent=2)
-    f.write("\n")
-print(f"registered hook in {settings_path}")
-PY
-  else
-    echo "warn: python3 not on PATH; add the PreToolUse entry to ${SETTINGS_FILE} by hand." >&2
   fi
 fi
 
