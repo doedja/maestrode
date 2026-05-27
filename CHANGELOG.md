@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+Streaming + idle abort (the "feels hung" fix):
+
+- **SSE streaming on the call.** Payload now sets `stream:true` with
+  `stream_options.include_usage:true`. The shim pipes curl into a small
+  Python parser that assembles `delta.content` / `delta.reasoning_content`
+  and prints a stderr heartbeat every ~1s
+  (`[maestrode streaming content=N reasoning=M]`) so you can see progress
+  during long generations instead of staring at a frozen prompt.
+- **Idle abort.** Curl gains `--connect-timeout 10` plus
+  `--speed-time 30 --speed-limit 1`. A wedged stream now dies in ~30s
+  instead of running the full `MAESTRODE_CURL_TIMEOUT` (600s). The retry
+  loop treats curl exit 28 as transient and backs off, so a stuck call
+  fails over fast.
+- **Graceful fallback.** Parser detects non-SSE bodies (regular JSON, error
+  payloads) and dumps them verbatim, so providers that ignore `stream:true`
+  still work (no heartbeat, but content comes through).
+- **Warmup stays non-stream.** The optional `--warmup` priming call strips
+  `stream` / `stream_options` from its tiny payload so the warmup parser
+  can `json.load` the response directly.
+
 Hang fix:
 
 - **Stdin gate hardened.** The shim's `[[ ! -t 0 ]]` check matched any

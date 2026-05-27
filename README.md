@@ -102,6 +102,7 @@ Set `MAESTRODE_API_KEY` and `MAESTRODE_ENDPOINT` in `~/.config/maestrode/env`.
 
 ## Feedback the shim gives you
 
+- **`[maestrode streaming ...]`** heartbeat every ~1s while the call streams in (content + reasoning char counters). The call is wired through SSE with `--connect-timeout 10` and `--speed-time 30 --speed-limit 1`, so a wedged stream dies in ~30s instead of running the full `MAESTRODE_CURL_TIMEOUT` (600s). Retries treat the stall as transient.
 - **`finish=length`** in the stderr stat line plus `response cut by max_tokens` warning when the model hit the cap. Raise `--max-tokens` (or split the brief).
 - **`N <<<FILE:>>> block(s) opened but not closed`** when `--files` parsing finds a truncated response. Closed blocks still get written; reissue the missing ones.
 - **Exit 5 (`NEEDS_SMART`)** when the cheap muscle decides the brief is too thin or the task exceeds its capability. Session + file writes are skipped. The brain takes over.

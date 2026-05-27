@@ -212,7 +212,9 @@ TASK="${1:-}"
 PROMPT_FILE=$(mktemp -t maestrode_prompt.XXXXXX)
 PAYLOAD_FILE=$(mktemp -t maestrode_payload.XXXXXX)
 RESP_FILE=$(mktemp -t maestrode_resp.XXXXXX)
-trap 'rm -f "$PROMPT_FILE" "$PAYLOAD_FILE" "$RESP_FILE"' EXIT
+HDRS_FILE=$(mktemp -t maestrode_hdrs.XXXXXX)
+PARSER_FILE=$(mktemp -t maestrode_parser.XXXXXX)
+trap 'rm -f "$PROMPT_FILE" "$PAYLOAD_FILE" "$RESP_FILE" "$HDRS_FILE" "$PARSER_FILE"' EXIT
 
 {
   # Only read stdin when it is a real piped/redirected/heredoc input. A bare
@@ -302,6 +304,8 @@ payload = {
     "model": os.environ["MODEL"],
     "max_tokens": int(os.environ["MAX_TOKENS"]),
     "messages": messages,
+    "stream": True,
+    "stream_options": {"include_usage": True},
 }
 re_effort = os.environ.get("REASONING_EFFORT") or ""
 if re_effort:
@@ -315,7 +319,7 @@ PY
 if [[ "$WARMUP" == "1" ]]; then
   WARMUP_PAYLOAD=$(mktemp -t maestrode_warm.XXXXXX)
   WARMUP_RESP=$(mktemp -t maestrode_warm_resp.XXXXXX)
-  trap 'rm -f "$WARMUP_PAYLOAD" "$WARMUP_RESP" "$PROMPT_FILE" "$PAYLOAD_FILE" "$RESP_FILE"' EXIT
+  trap 'rm -f "$WARMUP_PAYLOAD" "$WARMUP_RESP" "$PROMPT_FILE" "$PAYLOAD_FILE" "$RESP_FILE" "$HDRS_FILE" "$PARSER_FILE"' EXIT
   python3 - "$PAYLOAD_FILE" "$WARMUP_PAYLOAD" <<'PY'
 import json, sys
 p = json.load(open(sys.argv[1]))
@@ -324,6 +328,9 @@ if warmup_msgs and warmup_msgs[-1].get("role") == "user":
     warmup_msgs[-1] = {"role":"user","content":"ack"}
 p["messages"] = warmup_msgs
 p["max_tokens"] = 32
+# warmup is a tiny non-stream call so we can json.load the response directly.
+p.pop("stream", None)
+p.pop("stream_options", None)
 json.dump(p, open(sys.argv[2], "w"))
 PY
   curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-600}" \
@@ -365,20 +372,135 @@ fi
 
 CALL_T0=$(python3 -c 'import time; print(time.time())')
 
+# SSE parser: reads streaming chunks on stdin, prints stderr heartbeat,
+# and synthesizes a non-streaming-shape JSON to stdout so the downstream
+# parser (FULL/RAW/FILES_DIR block) works unchanged. If the response body
+# is not SSE (HTTP error JSON), the raw body is passed through.
+cat > "$PARSER_FILE" <<'PY'
+import json, sys, time
+
+content = []
+reasoning = []
+usage = None
+model = None
+finish = None
+last_hb = time.time()
+content_chars = 0
+reasoning_chars = 0
+saw_sse = False
+raw_buf = []
+done = False
+
+# Iterate to natural EOF (do NOT break on [DONE]). Breaking early closes
+# the read end of the curl|python pipe, curl then writes the final bytes
+# into a broken pipe and exits 56, which the parent loop misreads as a
+# transport failure even though we already have the full response.
+for raw in sys.stdin:
+    line = raw.rstrip('\n').rstrip('\r')
+    if not line.startswith('data: '):
+        if not saw_sse:
+            raw_buf.append(raw)
+        continue
+    saw_sse = True
+    payload = line[6:]
+    if payload == '[DONE]':
+        done = True
+        continue
+    if done:
+        continue
+    try:
+        chunk = json.loads(payload)
+    except json.JSONDecodeError:
+        continue
+    if chunk.get('error'):
+        json.dump(chunk, sys.stdout)
+        sys.exit(0)
+    if chunk.get('usage'):
+        usage = chunk['usage']
+    if not model and chunk.get('model'):
+        model = chunk['model']
+    choices = chunk.get('choices') or []
+    if not choices:
+        continue
+    delta = choices[0].get('delta') or {}
+    c = delta.get('content')
+    if c:
+        content.append(c)
+        content_chars += len(c)
+    r = delta.get('reasoning_content')
+    if r:
+        reasoning.append(r)
+        reasoning_chars += len(r)
+    fr = choices[0].get('finish_reason')
+    if fr:
+        finish = fr
+    now = time.time()
+    if now - last_hb >= 1.0:
+        if reasoning_chars and not content_chars:
+            sys.stderr.write(f"[maestrode streaming reasoning={reasoning_chars}]\n")
+        else:
+            sys.stderr.write(f"[maestrode streaming content={content_chars} reasoning={reasoning_chars}]\n")
+        sys.stderr.flush()
+        last_hb = now
+
+if not saw_sse:
+    sys.stdout.write(''.join(raw_buf))
+    sys.exit(0)
+
+out = {
+    "model": model or "",
+    "choices": [{
+        "message": {
+            "content": "".join(content),
+            "reasoning_content": "".join(reasoning) or None,
+        },
+        "finish_reason": finish or "stop",
+    }],
+    "usage": usage or {},
+}
+json.dump(out, sys.stdout)
+PY
+
 attempt=0
 backoff=2
 HTTP_CODE=""
 while true; do
-  HTTP_CODE=$(curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-600}" \
-    -o "$RESP_FILE" -w '%{http_code}' \
+  : > "$RESP_FILE"
+  : > "$HDRS_FILE"
+  set +e
+  curl --no-buffer -sS \
+    --connect-timeout 10 \
+    --speed-time 30 --speed-limit 1 \
+    --max-time "${MAESTRODE_CURL_TIMEOUT:-600}" \
+    -D "$HDRS_FILE" \
     -X POST "$ENDPOINT" \
     -H "Authorization: Bearer ${MAESTRODE_API_KEY}" \
     -H "Content-Type: application/json" \
-    --data-binary "@$PAYLOAD_FILE") || {
-      echo "maestrode: curl failed" >&2
-      [[ -s "$RESP_FILE" ]] && cat "$RESP_FILE" >&2
+    --data-binary "@$PAYLOAD_FILE" \
+    | python3 -u "$PARSER_FILE" > "$RESP_FILE"
+  CURL_EXIT="${PIPESTATUS[0]}"
+  set -e
+  HTTP_CODE=$(awk 'NR==1 {print $2; exit}' "$HDRS_FILE" 2>/dev/null || echo "")
+
+  # curl exit 28 = total --max-time hit OR idle abort via --speed-time.
+  # Treat as transient and retry with backoff. This is the "stuck for 10 min"
+  # fix: --speed-time 30 means a wedged stream dies in 30s, not 600s.
+  if [[ "$CURL_EXIT" == "28" ]]; then
+    if [[ $attempt -ge $MAX_RETRIES ]]; then
+      echo "maestrode: stream stalled (curl exit 28) after $MAX_RETRIES retries" >&2
       exit 1
-    }
+    fi
+    echo "maestrode: stream stalled, retry $((attempt+1))/$MAX_RETRIES after ${backoff}s" >&2
+    sleep "$backoff"
+    attempt=$((attempt+1))
+    backoff=$((backoff*2))
+    continue
+  fi
+  if [[ "$CURL_EXIT" != "0" ]]; then
+    echo "maestrode: curl exit $CURL_EXIT" >&2
+    [[ -s "$RESP_FILE" ]] && cat "$RESP_FILE" >&2
+    exit 1
+  fi
   if [[ "$HTTP_CODE" == "429" || "$HTTP_CODE" == "503" || "$HTTP_CODE" == "502" ]]; then
     if [[ $attempt -ge $MAX_RETRIES ]]; then
       echo "maestrode: $HTTP_CODE after $MAX_RETRIES retries" >&2

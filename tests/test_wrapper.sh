@@ -101,21 +101,36 @@ code=$?
 set -e
 [[ $code -eq 66 ]] && ok "exit 66 on missing file" || ko "wrong exit: $code"
 
-# stub curl for the rest of the tests
+# stub curl for the rest of the tests. The shim now streams SSE: pipes curl
+# stdout into the SSE parser and reads HTTP status from a -D headers file.
+# This stub converts the non-stream fixture JSON into a 2-chunk SSE stream
+# so the parser is actually exercised end-to-end.
 SHIM_BIN="$TMP/bin"
 FIXTURE="$TMP/fixture.json"
 mkdir -p "$SHIM_BIN"
 cat > "$SHIM_BIN/curl" <<EOF
 #!/usr/bin/env bash
-o=""
+FIXTURE="$FIXTURE"
+hdrs=""
 while [[ \$# -gt 0 ]]; do
   case "\$1" in
-    -o) o="\$2"; shift 2 ;;
+    -D) hdrs="\$2"; shift 2 ;;
     *) shift ;;
   esac
 done
-cp "$FIXTURE" "\$o"
-echo -n "200"
+[[ -n "\$hdrs" ]] && printf 'HTTP/1.1 200 OK\r\n\r\n' > "\$hdrs"
+python3 - "\$FIXTURE" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+choice = d["choices"][0]
+msg = choice.get("message") or {}
+content = msg.get("content") or ""
+finish = choice.get("finish_reason") or "stop"
+usage = d.get("usage") or {}
+sys.stdout.write("data: " + json.dumps({"choices":[{"delta":{"content":content},"finish_reason":None}]}) + "\n\n")
+sys.stdout.write("data: " + json.dumps({"choices":[{"delta":{},"finish_reason":finish}],"usage":usage}) + "\n\n")
+sys.stdout.write("data: [DONE]\n\n")
+PY
 EOF
 chmod +x "$SHIM_BIN/curl"
 
