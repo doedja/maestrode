@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+Installer "just works" on macOS / Linux:
+
+- **Auto-PATH on install.** `install.sh` now appends a marked PATH export
+  to the user's shell rc (`~/.zshrc`, `~/.bashrc` or `~/.bash_profile`,
+  `~/.config/fish/config.fish`) so `maestrode "task"` works in a new shell
+  and the Claude Code skill (which invokes `maestrode` by name) works
+  without manual rc edits. Marker-guarded for idempotency.
+- **Auto-clean on uninstall.** `--uninstall` strips the marked block from
+  any shell rc it finds. Opt out via `MAESTRODE_NO_PATH=1` if you'd
+  rather manage PATH yourself. Windows already did this; macOS / Linux
+  now match.
+
 Streaming + idle abort (the "feels hung" fix):
 
 - **SSE streaming on the call.** Payload now sets `stream:true` with

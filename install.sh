@@ -139,6 +139,32 @@ if [[ "$ACTION" == "uninstall" ]]; then
   fi
   cleanup_legacy_hooks
   cleanup_legacy_sentinel
+  # Strip the PATH export we may have appended on install. Uses the
+  # `# maestrode: PATH` marker line + the export below it. Quiet no-op if
+  # not present.
+  for rc in "${HOME}/.zshrc" "${HOME}/.bashrc" "${HOME}/.bash_profile" "${HOME}/.config/fish/config.fish"; do
+    [[ -f "$rc" ]] || continue
+    if grep -Fq '# maestrode: PATH' "$rc"; then
+      python3 - "$rc" <<'PY' || true
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+lines = p.read_text().splitlines(keepends=True)
+out = []
+skip = 0
+for ln in lines:
+    if skip > 0:
+        skip -= 1
+        continue
+    if ln.strip() == '# maestrode: PATH':
+        skip = 1
+        continue
+    out.append(ln)
+p.write_text(''.join(out))
+PY
+      echo "removed maestrode PATH line from $rc"
+      removed=1
+    fi
+  done
   if [[ $KEEP_CONFIG -eq 0 ]] && [[ -d "$CONFIG_DIR" ]]; then
     rm -rf "$CONFIG_DIR"
     echo "removed $CONFIG_DIR"
@@ -230,10 +256,51 @@ fi
 
 echo
 echo "installed maestrode to ${INSTALL_DIR}/maestrode"
-case ":$PATH:" in
-  *":$INSTALL_DIR:"*) ;;
-  *) echo "warn: ${INSTALL_DIR} is not on PATH. add it in your shell rc." ;;
-esac
+
+# Auto-append PATH export to the user's shell rc so `maestrode "task"` and
+# the skill (which invokes `maestrode` by name from Bash) just work. Skip
+# if already on PATH or if MAESTRODE_NO_PATH=1.
+maestrode_path_setup() {
+  case ":$PATH:" in
+    *":$INSTALL_DIR:"*) return 0 ;;
+  esac
+  if [[ "${MAESTRODE_NO_PATH:-0}" == "1" ]]; then
+    echo "warn: ${INSTALL_DIR} is not on PATH (MAESTRODE_NO_PATH=1, skipping rc edit)."
+    return 0
+  fi
+  local shell_name rc line marker
+  shell_name=$(basename "${SHELL:-/bin/sh}")
+  case "$shell_name" in
+    zsh)  rc="${HOME}/.zshrc" ;;
+    bash)
+      if [[ -f "${HOME}/.bashrc" ]]; then rc="${HOME}/.bashrc"
+      else rc="${HOME}/.bash_profile"
+      fi ;;
+    fish)
+      rc="${HOME}/.config/fish/config.fish"
+      mkdir -p "$(dirname "$rc")"
+      line="fish_add_path \"${INSTALL_DIR}\""
+      marker="# maestrode: PATH"
+      if [[ -f "$rc" ]] && grep -Fq "$marker" "$rc"; then return 0; fi
+      printf '\n%s\n%s\n' "$marker" "$line" >> "$rc"
+      echo "added ${INSTALL_DIR} to PATH in ${rc}"
+      echo "open a new shell, or run: source ${rc}"
+      return 0 ;;
+    *)
+      echo "warn: unknown shell '${shell_name}'. add ${INSTALL_DIR} to PATH manually:"
+      echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+      return 0 ;;
+  esac
+  line="export PATH=\"${INSTALL_DIR}:\$PATH\""
+  marker="# maestrode: PATH"
+  if [[ -f "$rc" ]] && grep -Fq "$marker" "$rc"; then
+    return 0
+  fi
+  printf '\n%s\n%s\n' "$marker" "$line" >> "$rc"
+  echo "added ${INSTALL_DIR} to PATH in ${rc}"
+  echo "open a new shell, or run: source ${rc}"
+}
+maestrode_path_setup
 
 if [[ ! -s "$ENV_FILE" ]] || ! grep -q '^MAESTRODE_API_KEY=' "$ENV_FILE"; then
   echo
