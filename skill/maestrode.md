@@ -4,9 +4,10 @@ description: >
   Delegation mode for code work. Claude (brain) plans, reads, decides,
   reviews, applies, runs tests, iterates. DeepSeek V4 Flash (muscle, via
   the `maestrode` shim) drafts code, prose, configs, multi-file patches.
-  Stays on across the session until "maestrode off". Triggers: "maestrode
-  on", "maestrode mode", "use maestrode", "/maestrode", or any user
-  request to route work through the cheap muscle model.
+  Stays on across the session via session-scoped hooks until "maestrode
+  off". Triggers: "maestrode on", "maestrode mode", "use maestrode",
+  "/maestrode", or any user request to route work through the cheap
+  muscle model.
 ---
 
 # maestrode mode
@@ -20,29 +21,61 @@ the user said do it yourself, or an architecture / security call the
 brain must own. If your next tool call is Edit or Write and none of those
 apply, you skipped a delegation.
 
-State lives in this conversation only. **On** after "maestrode on" /
-"use maestrode" / invoke this skill. **Off** after "maestrode off" /
-"normal mode" / new session. There is no on-disk flag and no hook; the
-mode is whatever the footer tag below says it is.
+## Persistence is hook-driven (you do not have to self-remind)
 
-Earlier versions wrote `~/.config/maestrode/active` and ran a PreToolUse
-reminder hook. That state was global and outlived sessions, so a session
-that ended without "maestrode off" leaked the mode into every future
-session. The installer self-heals: any prior hook entry, hook script,
-and sentinel file are removed on the next `./install.sh` run.
+The installer registers three Claude Code hooks that key all state to
+`session_id` under `~/.config/maestrode/sessions/<session_id>`:
 
-## Required per-turn footer tag (keeps the mode live)
+- **UserPromptSubmit** captures "maestrode on" / "off" from your words,
+  then injects a one-line `[maestrode ON]` banner into your context every
+  turn while active. That banner is the continuous trigger, pushed by the
+  harness, so the mode cannot silently fade the way a brain-emitted footer
+  tag did. When you drift (cold direct edits or subagent spawns piling up
+  without a delegation), the banner escalates to `[maestrode ON, drift]`
+  with the count.
+- **PreToolUse** (`Edit|Write|MultiEdit|NotebookEdit|Task|Bash`) does the
+  bookkeeping behind that drift count and resets it whenever you make a real
+  `maestrode ...` call.
+- **SessionEnd** clears this session's state. A 7-day reaper mops up sessions
+  that crashed.
 
-While maestrode is on, end every assistant turn with one of:
+Because state is keyed to `session_id`, it never leaks into another session.
+This is the fix for the old global `~/.config/maestrode/active` sentinel,
+which outlived sessions and forced the mode on when nobody asked. The
+installer still self-heals: any legacy hook entry, hook script, or sentinel
+is removed on the next `./install.sh` run.
 
-    [maestrode: delegated <comma-separated files written by muscle>]
-    [maestrode: direct: <one-line reason>]
+Your job is just the call: delegate, or go direct for a named reason. The
+banner re-states the rule each turn, so there is nothing to remember. If
+hooks are disabled (`MAESTRODE_NO_HOOKS=1`) the mode is conversation-only and
+relies on this skill description alone, which fades. Hooks are recommended.
 
-This is the continuous trigger. The skill description fires once when matched, then conversation churn buries it. The footer is what re-instantiates the rule on every turn, the same mechanism that makes caveman stick. Without it the mode silently fades after a few turns and brain reverts to direct Edit/Write by default.
+You may still end a turn with `[maestrode: delegated <files>]` or
+`[maestrode: direct: <reason>]` as a visible breadcrumb for the user, but it
+is optional now: forgetting it costs nothing because the hook owns
+persistence.
 
-Use `direct:` only with a real reason from the list above. "I forgot" is not a reason; if that happens, the next turn should be `delegated` to course-correct.
+## Subagents under maestrode
 
-Skip the tag ONLY on pure-conversation turns that produced no code or prose work (a clarifying question, a one-sentence status answer). When in doubt, tag.
+A subagent you spawn with the Agent tool runs the expensive model and does
+NOT inherit this mode: it never sees this skill. Two rules:
+
+1. **Prefer no subagent for a straight draft.** brain to Opus-subagent to
+   muscle spends Opus tokens on the orchestration layer. If the task is just
+   "write these files", call the muscle directly and skip the subagent.
+2. **If you do spawn one, embed the delegation contract in its prompt** so the
+   subagent itself routes drafts through the muscle. Subagents have Bash and
+   inherit PATH, so `maestrode` is callable from inside them. Paste this block
+   into the subagent prompt verbatim:
+
+       You are operating under maestrode delegation mode. For any code, prose,
+       or config you would author, do NOT write it yourself: call the cheap
+       muscle model via Bash and apply its output.
+           maestrode -f <relevant files> --files out/ "<brief>"
+       The muscle writes <<<FILE: path>>> ... <<<END FILE>>> blocks into out/.
+       Review the diff, run the tests, iterate. Author directly only to apply
+       that output, for a one-line tweak, or for an architecture/security call
+       you must own.
 
 ## The shim, in one screen
 
@@ -178,9 +211,10 @@ exit, that batch's output dir tells you exactly which concern to retry.
 
 ## Off-switch
 
-When user says "maestrode off": acknowledge, stop calling the shim, drop
-the footer tag, resume direct authoring. Skill goes dormant until
-reactivated.
+When user says "maestrode off": acknowledge, stop calling the shim, resume
+direct authoring. The UserPromptSubmit hook clears this session's state on
+that phrase and stops injecting the banner, so the mode goes dormant on its
+own. No cleanup needed from you.
 
 ## Reference
 

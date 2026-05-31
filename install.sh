@@ -4,20 +4,23 @@
 #   2) from clone:  ./install.sh  (uses the local src/maestrode file)
 # Idempotent: safe to re-run.
 #
-# Also drops the Claude Code skill at ~/.claude/skills/maestrode/SKILL.md
-# when ~/.claude exists. The skill carries the per-turn footer-tag rule
-# that keeps mode visible across turns; no filesystem state, no hooks.
+# Also drops the Claude Code skill at ~/.claude/skills/maestrode/SKILL.md and
+# registers three persistence hooks in settings.json (UserPromptSubmit,
+# PreToolUse, SessionEnd) when ~/.claude exists. The hooks key all state to
+# session_id under ~/.config/maestrode/sessions/, so the mode sticks across
+# turns yet cannot leak into other sessions.
 #   Set MAESTRODE_NO_SKILL=1 to skip the skill.
+#   Set MAESTRODE_NO_HOOKS=1 to skip hook registration (conversation-only).
 #   Override paths with MAESTRODE_SKILL_DIR / MAESTRODE_HOOK_DIR /
 #   MAESTRODE_SETTINGS_FILE.
 #
 # Every install also runs a one-time cleanup of the legacy PreToolUse
 # reminder hook (and the short-lived SessionStart cleanup hook) plus the
-# old ~/.config/maestrode/active sentinel. Those were removed because the
-# sentinel was global filesystem state masquerading as session state;
-# session-end without "maestrode off" leaked it into future sessions and
-# triggered the reminder when the user never activated the mode. Mode now
-# lives entirely in the conversation: skill description + footer tag.
+# old ~/.config/maestrode/active sentinel. Those were removed because that
+# sentinel was a single GLOBAL file: session-end without "maestrode off"
+# leaked the mode into future sessions and fired the reminder when the user
+# never activated it. The new hooks fix that at the root by keying state to
+# session_id, so re-introducing a hook does not repeat the leak.
 #
 # uninstall:
 #   ./install.sh --uninstall            (remove binary + config + sessions + skill + legacy hooks)
@@ -99,6 +102,127 @@ PY
   return 0
 }
 
+# maestrode_hook_cmd: absolute command string for a given hook event. Uses the
+# install path (not bare `maestrode`) so the hook fires regardless of the PATH
+# the harness hands to hook subprocesses.
+#
+# pre-tool is the hot path (fires on every Edit/Write/Bash/Task call in every
+# session). It gets a cheap shell guard: when no session is active anywhere, the
+# sessions dir is empty and the command is a sub-millisecond `ls` that exits 0,
+# with no python startup. Only when a session is active does it exec the shim.
+# This keeps the global cost near zero for sessions that never use maestrode.
+maestrode_hook_cmd() {
+  case "$1" in
+    pre-tool)
+      printf '%s' "[ -n \"\$(ls -A '${CONFIG_DIR}/sessions' 2>/dev/null)\" ] && exec '${INSTALL_DIR}/maestrode' hook pre-tool || exit 0" ;;
+    *)
+      printf '%s' "${INSTALL_DIR}/maestrode hook $1" ;;
+  esac
+}
+
+# PreToolUse matcher: tools whose use we track or nudge on while mode is active.
+HOOK_PRETOOL_MATCHER="Edit|Write|MultiEdit|NotebookEdit|Task|Bash"
+
+# install_hooks: register the three persistence hooks in settings.json,
+# idempotently (keyed by the exact command string). Unlike the legacy global
+# sentinel, these hooks are no-ops unless a per-session_id flag exists, so they
+# never leak the mode across sessions. Safe to re-run.
+install_hooks() {
+  command -v python3 >/dev/null 2>&1 || {
+    echo "warn: python3 not found, skipping hook registration in ${SETTINGS_FILE}" >&2
+    return 0
+  }
+  python3 - "$SETTINGS_FILE" \
+    "UserPromptSubmit" ""                       "$(maestrode_hook_cmd user-prompt)" \
+    "PreToolUse"       "$HOOK_PRETOOL_MATCHER"   "$(maestrode_hook_cmd pre-tool)" \
+    "SessionEnd"       ""                        "$(maestrode_hook_cmd session-end)" <<'PY'
+import json, os, sys
+settings_path = sys.argv[1]
+# remaining args are (event, matcher, command) triples
+triples = []
+rest = sys.argv[2:]
+for i in range(0, len(rest), 3):
+    triples.append((rest[i], rest[i + 1], rest[i + 2]))
+
+try:
+    with open(settings_path) as f:
+        d = json.load(f)
+except FileNotFoundError:
+    d = {}
+except (json.JSONDecodeError, OSError):
+    print(f"warn: could not parse {settings_path}, skipping hook registration", file=sys.stderr)
+    sys.exit(0)
+
+hooks = d.setdefault("hooks", {})
+changed = False
+for event, matcher, command in triples:
+    entries = hooks.setdefault(event, [])
+    # already present (same command anywhere in this event)? skip.
+    if any(hh.get("command") == command
+           for entry in entries for hh in entry.get("hooks", [])):
+        continue
+    new_entry = {"hooks": [{"type": "command", "command": command}]}
+    if matcher:
+        new_entry["matcher"] = matcher
+    entries.append(new_entry)
+    changed = True
+
+if changed:
+    with open(settings_path, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    print(f"registered maestrode hooks in {settings_path}")
+else:
+    print(f"maestrode hooks already present in {settings_path}")
+PY
+}
+
+# remove_hooks: strip the three persistence hook entries from settings.json on
+# uninstall. Matches by command string so it leaves unrelated hooks intact.
+remove_hooks() {
+  [[ -f "$SETTINGS_FILE" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$SETTINGS_FILE" \
+    "$(maestrode_hook_cmd user-prompt)" \
+    "$(maestrode_hook_cmd pre-tool)" \
+    "$(maestrode_hook_cmd session-end)" <<'PY'
+import json, sys
+settings_path = sys.argv[1]
+our_cmds = set(sys.argv[2:])
+try:
+    with open(settings_path) as f:
+        d = json.load(f)
+except (json.JSONDecodeError, OSError):
+    sys.exit(0)
+hooks = d.get("hooks") or {}
+changed = False
+for event in list(hooks.keys()):
+    new_entries = []
+    for entry in hooks[event]:
+        kept = [hh for hh in entry.get("hooks", []) if hh.get("command") not in our_cmds]
+        if len(kept) != len(entry.get("hooks", [])):
+            changed = True
+        if kept:
+            e = dict(entry)
+            e["hooks"] = kept
+            new_entries.append(e)
+    if new_entries:
+        hooks[event] = new_entries
+    else:
+        del hooks[event]
+        changed = True
+if changed:
+    if hooks:
+        d["hooks"] = hooks
+    else:
+        d.pop("hooks", None)
+    with open(settings_path, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    print(f"removed maestrode hook entries from {settings_path}")
+PY
+}
+
 # cleanup_legacy_sentinel: remove the old ~/.config/maestrode/active file
 # left behind by prior-version sessions that ended without "maestrode off".
 # No-op when absent.
@@ -137,6 +261,7 @@ if [[ "$ACTION" == "uninstall" ]]; then
     echo "removed $SKILL_FILE"
     removed=1
   fi
+  remove_hooks
   cleanup_legacy_hooks
   cleanup_legacy_sentinel
   # Strip the PATH export we may have appended on install. Uses the
@@ -182,7 +307,7 @@ PY
   exit 0
 fi
 
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "${CONFIG_DIR}/sessions"
 
 # Self-heal any prior-version state before the rest of install runs.
 cleanup_legacy_hooks
@@ -240,6 +365,14 @@ if [[ "${MAESTRODE_NO_SKILL:-0}" != "1" ]] && [[ -d "${HOME}/.claude" || -n "${M
     fi
     rm -f "$SKILL_TMP"
   fi
+fi
+
+# Register the persistence hooks alongside the skill. Same gate as the skill
+# (Claude Code present, or an explicit settings override). Set
+# MAESTRODE_NO_HOOKS=1 to skip and run conversation-only.
+if [[ "${MAESTRODE_NO_HOOKS:-0}" != "1" ]] && \
+   { [[ -d "${HOME}/.claude" ]] || [[ -n "${MAESTRODE_SETTINGS_FILE:-}" ]]; }; then
+  install_hooks
 fi
 
 ENV_FILE="${CONFIG_DIR}/env"

@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+Persistence via session-scoped hooks (the "mode keeps fading" fix):
+
+- **`maestrode hook <event>` subcommand.** New stdin-driven subcommand for
+  three Claude Code hooks: `user-prompt` (UserPromptSubmit), `pre-tool`
+  (PreToolUse), `session-end` (SessionEnd). No API key, no network. It keys
+  all state to `session_id` under `~/.config/maestrode/sessions/`.
+- **Activation and the standing banner are harness-pushed, not brain-emitted.**
+  The UserPromptSubmit hook captures "maestrode on" / "off" from the user's
+  words, writes a per-session flag, and injects a `[maestrode ON]` banner into
+  the model's context every turn while active. This replaces the per-turn
+  footer tag the brain had to remember and kept forgetting. When direct edits
+  or subagent spawns pile up without a delegation, the banner escalates to
+  `[maestrode ON, drift]` with the count.
+- **Subagent (Task) coverage.** The PreToolUse matcher includes `Task`, so
+  spawning a subagent while in mode is counted as a bypass and the skill now
+  ships a copy-paste delegation contract to embed in subagent prompts.
+- **Why this does not repeat the old leak.** A previous version used a single
+  global `~/.config/maestrode/active` sentinel that outlived sessions and
+  forced the mode on when nobody asked, which is why hooks were ripped out. The
+  new state is keyed to `session_id`: a new session has a new id and never sees
+  another session's flag. SessionEnd clears state, and a 7-day reaper handles
+  crashes.
+- **Installer wires it up.** `install.sh` registers the three hooks in
+  `settings.json` idempotently (absolute command path, keyed by command
+  string), creates the `sessions/` dir, and `--uninstall` removes the entries
+  while leaving unrelated hooks intact. Opt out with `MAESTRODE_NO_HOOKS=1` for
+  conversation-only mode.
+- **Tests.** `tests/hook_test.sh` drives every branch with canned stdin JSON
+  and asserts both stdout and filesystem state, including the cross-session
+  leak guarantee and the stale reaper.
+- **Known limitation.** Claude Code currently logs but does not inject
+  PreToolUse `additionalContext` into the model (anthropics/claude-code#19432),
+  so the point-of-action nudge is forward-compatible only. The load-bearing
+  channel is the UserPromptSubmit banner, which works today and re-states the
+  drift count each turn.
+
 Installer "just works" on macOS / Linux:
 
 - **Auto-PATH on install.** `install.sh` now appends a marked PATH export

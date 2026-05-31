@@ -66,7 +66,9 @@ iwr -useb https://raw.githubusercontent.com/doedja/maestrode/main/install.ps1 -O
 
 ### Use it
 
-In Claude Code: say **`maestrode on`** or `/maestrode`. The skill stays on for the rest of the session; Claude delegates code-writing to the cheap muscle. Say `maestrode off` to drop back.
+In Claude Code: say **`maestrode on`** or `/maestrode`. The mode stays on for the rest of the session; Claude delegates code-writing to the cheap muscle. Say `maestrode off` to drop back.
+
+Persistence is hook-driven. The installer registers three Claude Code hooks (UserPromptSubmit, PreToolUse, SessionEnd) that key all state to `session_id`, so the mode sticks across turns without the model having to remember it, and never leaks into another session. Opt out with `MAESTRODE_NO_HOOKS=1` for conversation-only mode.
 
 CLI direct: `maestrode "task"`. See `examples/quickstart.sh` for a 30-second runnable demo.
 

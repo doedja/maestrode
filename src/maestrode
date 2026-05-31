@@ -14,6 +14,8 @@
 #   maestrode --full "include reasoning trace"
 #   maestrode --model gpt-5.1-codex "swap model"
 #   maestrode gain                 show aggregate usage stats from the local log
+#   maestrode hook <event>         Claude Code persistence hook (stdin JSON);
+#                                  event in: user-prompt, pre-tool, session-end
 #
 # flags:
 #   --session NAME    persist multi-turn at ~/.config/maestrode/sessions/NAME.json
@@ -166,6 +168,203 @@ print()
 sys.exit(0)
 PY
   exit $?
+fi
+
+# Subcommand: `maestrode hook <event>` drives the Claude Code persistence hooks.
+# Reads the hook JSON payload from stdin, keys all state to session_id, and
+# prints the hook output JSON to stdout. No API key, no network.
+#
+# Events:
+#   user-prompt   UserPromptSubmit: capture activation/deactivation from the
+#                 user's words, inject the standing banner every turn while
+#                 active, escalate on drift, reap stale sessions.
+#   pre-tool      PreToolUse: record real muscle calls (Bash `maestrode ...`),
+#                 nudge on cold direct edits and on subagent (Task) spawns.
+#   session-end   SessionEnd: remove this session's state files.
+#
+# State lives under ${CONFIG_DIR}/sessions/, one set of files per session_id:
+#   <sid>            exists => mode active (mtime = activation time)
+#   <sid>.lastcall   mtime/contents = last real muscle delegation
+#   <sid>.direct     count of cold direct edits since the last delegation
+#
+# Keyed by session_id so state cannot leak across sessions: a new session has a
+# new id and never sees another session's flag. This is the fix for the old
+# global ~/.config/maestrode/active sentinel that leaked the mode forward.
+if [[ "${1:-}" == "hook" ]]; then
+  shift
+  # Slurp the hook JSON payload from stdin into a var FIRST, then feed the
+  # program to python via a normal `- <<HEREDOC`. python reads the payload from
+  # the env var, not stdin (the `-` heredoc form would otherwise shadow it).
+  # This avoids heredoc-inside-$()-command-substitution, which macOS bash 3.2
+  # mis-parses.
+  MAESTRODE_HOOK_PAYLOAD="$(cat)" \
+  MAESTRODE_HOOK_EVENT="${1:-}" \
+  MAESTRODE_SESSIONS_DIR="${CONFIG_DIR}/sessions" \
+  python3 - <<'PY'
+import json, os, re, sys, time, pathlib
+
+event = os.environ.get("MAESTRODE_HOOK_EVENT", "")
+sessions_dir = pathlib.Path(os.environ["MAESTRODE_SESSIONS_DIR"])
+
+try:
+    payload = json.loads(os.environ.get("MAESTRODE_HOOK_PAYLOAD") or "{}")
+except Exception:
+    payload = {}
+
+sid = payload.get("session_id") or ""
+safe = re.sub(r"[^A-Za-z0-9_.-]", "_", sid) if sid else ""
+
+BANNER = (
+    "Default for any code, prose, or config draft this turn: delegate to the "
+    "muscle:  maestrode -f <files> --files out/ \"<brief>\". Direct Edit/Write "
+    "only to apply muscle output, for a one-line tweak, or for an "
+    "architecture/security call you must own (say which). Spawning a subagent? "
+    "It will NOT inherit this mode: embed the delegation contract in its prompt, "
+    "or let the muscle draft directly."
+)
+
+ACTIVATE = re.compile(
+    r"(?:^|\b)(?:/maestrode\b|maestrode\s+(?:on|mode)\b|use\s+maestrode\b"
+    r"|turn\s+on\s+maestrode\b|enable\s+maestrode\b)", re.I)
+DEACTIVATE = re.compile(
+    r"\b(?:maestrode\s+off|normal\s+mode|stop\s+maestrode|turn\s+off\s+maestrode"
+    r"|disable\s+maestrode)\b", re.I)
+
+def sfile(suffix=""):
+    return sessions_dir / (safe + suffix)
+
+def is_active():
+    return bool(safe) and sfile().exists()
+
+def clear_session():
+    for suffix in ("", ".lastcall", ".direct"):
+        try:
+            sfile(suffix).unlink()
+        except OSError:
+            pass
+
+def read_int(path):
+    try:
+        return int(path.read_text().strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+def reap(days=7):
+    cutoff = time.time() - days * 86400
+    try:
+        for p in sessions_dir.iterdir():
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj))
+    sys.exit(0)
+
+def silent():
+    # No stdout => the hook is a no-op for this call.
+    sys.exit(0)
+
+def ups(msg):
+    emit({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": msg,
+    }})
+
+def nudge(msg):
+    # Advisory only: additionalContext, no permissionDecision, so the user's
+    # normal permission flow for the tool is untouched (no auto-approve).
+    # NOTE: Claude Code currently logs but does NOT inject PreToolUse
+    # additionalContext into the model (bug anthropics/claude-code#19432), so
+    # this is forward-compatible and a no-op for the model today. The
+    # load-bearing channel is the UserPromptSubmit banner, which re-states the
+    # drift count next turn (the `.direct` counter below feeds it). Emitting it
+    # anyway costs nothing and starts working once the bug is fixed.
+    emit({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "additionalContext": msg,
+    }})
+
+if not safe:
+    # No session_id => cannot key state to a session. No-op (never global).
+    silent()
+
+try:
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+except OSError:
+    silent()
+
+if event == "user-prompt":
+    reap()
+    prompt = payload.get("prompt") or ""
+    if DEACTIVATE.search(prompt):
+        clear_session()
+        ups("[maestrode OFF] Mode deactivated. Resume direct authoring.")
+    if ACTIVATE.search(prompt):
+        sfile().write_text(str(time.time()))
+        ups("[maestrode ON] " + BANNER)
+    if is_active():
+        n = read_int(sfile(".direct"))
+        if n >= 2:
+            ups("[maestrode ON, drift] You have bypassed the muscle %d times "
+                "(direct edits or subagent spawns) since the last delegation. "
+                "Route the next draft through the muscle unless there is a named "
+                "reason (apply output, one-line tweak, architecture/security call "
+                "you must own)." % n)
+        ups("[maestrode ON] " + BANNER)
+    silent()
+
+if event == "pre-tool":
+    tool = payload.get("tool_name") or ""
+    tin = payload.get("tool_input") or {}
+    if tool == "Bash":
+        cmd = (tin.get("command") or "").lstrip()
+        # A real muscle delegation (not `maestrode hook`/`gain`) resets drift.
+        if re.match(r"maestrode\b", cmd) and not re.match(r"maestrode\s+(?:hook|gain)\b", cmd):
+            if is_active():
+                sfile(".lastcall").write_text(str(time.time()))
+                try:
+                    sfile(".direct").unlink()
+                except OSError:
+                    pass
+        silent()
+    if not is_active():
+        silent()
+    if tool == "Task":
+        # A subagent spawn while in mode is a bypass: count it so the next-turn
+        # banner escalation reflects it, same as a cold direct edit.
+        sfile(".direct").write_text(str(read_int(sfile(".direct")) + 1))
+        nudge("[maestrode] You are spawning a subagent. It runs the expensive "
+              "model and will NOT inherit maestrode. Either embed the delegation "
+              "contract in its prompt so it routes drafts through `maestrode` via "
+              "Bash, or skip the subagent and let the muscle draft directly. "
+              "Prefer the direct muscle call for a straight draft.")
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        last = 0.0
+        try:
+            last = float(sfile(".lastcall").read_text().strip() or "0")
+        except (OSError, ValueError):
+            last = 0.0
+        if time.time() - last > 120:
+            sfile(".direct").write_text(str(read_int(sfile(".direct")) + 1))
+            nudge("[maestrode] Direct edit while mode is ON and no recent muscle "
+                  "call. If this applies muscle output or is a one-line tweak, "
+                  "proceed. Otherwise this is a draft the muscle should write: "
+                  "maestrode -f <file> --files out/ \"<brief>\".")
+        silent()
+    silent()
+
+if event == "session-end":
+    clear_session()
+    silent()
+
+silent()
+PY
+  exit 0
 fi
 
 : "${MAESTRODE_API_KEY:?set MAESTRODE_API_KEY in ${ENV_FILE} or env}"
