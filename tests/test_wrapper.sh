@@ -509,6 +509,16 @@ rm -f "$REQ_CAP"
 env $PROF MAESTRODE_BRAIN_THINK=1 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --brain "plan x" >/dev/null 2>&1 || true
 [[ "$(field "(p.get('thinking') or {}).get('type')")" == "adaptive" ]] && ok "BRAIN_THINK=1 enables thinking" || ko "opt-in thinking failed: $(field "p.get('thinking')")"
 
+echo "== test 34c: MAESTRODE_BRAIN_THINKING_TYPE=disabled forces thinking.type=disabled =="
+rm -f "$REQ_CAP"
+env $PROF MAESTRODE_BRAIN_THINKING_TYPE=disabled PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --brain "plan x" >/dev/null 2>&1 || true
+[[ "$(field "(p.get('thinking') or {}).get('type')")" == "disabled" ]] && ok "brain thinking forced disabled" || ko "brain thinking type wrong: $(field "p.get('thinking')")"
+
+echo "== test 34d: CLI --think overrides MAESTRODE_BRAIN_THINKING_TYPE =="
+rm -f "$REQ_CAP"
+env $PROF MAESTRODE_BRAIN_THINKING_TYPE=disabled PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --brain --think "plan x" >/dev/null 2>&1 || true
+[[ "$(field "(p.get('thinking') or {}).get('type')")" == "adaptive" ]] && ok "CLI --think wins over env type" || ko "override precedence wrong: $(field "p.get('thinking')")"
+
 echo "== test 35: --model overrides the profile =="
 rm -f "$REQ_CAP"
 env $PROF PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --ultra --model my-override --files "$TMP/m2" "x" >/dev/null 2>&1 || true

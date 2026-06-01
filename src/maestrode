@@ -75,6 +75,11 @@
 #   MAESTRODE_BRAIN_MODEL    --brain planner (fallback: MAESTRODE_MODEL)
 #   MAESTRODE_BRAIN_ENDPOINT --brain endpoint (fallback: MAESTRODE_ENDPOINT)
 #   MAESTRODE_BRAIN_THINK    set 1 to give the brain a separate thinking channel
+#   MAESTRODE_BRAIN_THINKING_TYPE  force the brain's thinking.type (anthropic path):
+#                            disabled|adaptive|enabled. Use "disabled" for models
+#                            like MiniMax-M3 that otherwise reason in a hidden
+#                            channel until the window closes (empty-plan stall).
+#                            A CLI --think/--thinking-type/--thinking-budget wins.
 #   MAESTRODE_CONTEXT_LIMIT  model context window. When set, max_tokens is clamped
 #                            to (limit - est_input - margin) so the output
 #                            reservation never overshoots the window. Per-mode:
@@ -543,6 +548,16 @@ elif [[ "$BRAIN" == 1 ]]; then
   if [[ "${MAESTRODE_BRAIN_THINK:-0}" == "1" \
         && -z "$THINK" && -z "$THINKING_TYPE" && -z "$THINKING_BUDGET" ]]; then
     THINK=1
+  fi
+  # Some brain models (MiniMax-M3 on zen) reason in a separate thinking channel by
+  # default and, on a big open-ended brief, can burn the whole curl window there
+  # without emitting any plan content (the stall). MiniMax exposes no reasoning-cap
+  # param, so the only lever is thinking.type: set MAESTRODE_BRAIN_THINKING_TYPE=disabled
+  # to force the reasoning into the content stream (a real plan, no hidden channel).
+  # A CLI --think/--thinking-type/--thinking-budget always overrides this.
+  if [[ -n "${MAESTRODE_BRAIN_THINKING_TYPE:-}" \
+        && -z "$THINK" && -z "$THINKING_TYPE" && -z "$THINKING_BUDGET" ]]; then
+    THINKING_TYPE="$MAESTRODE_BRAIN_THINKING_TYPE"
   fi
 fi
 [[ -n "$MODEL_OVERRIDE" ]] && MODEL="$MODEL_OVERRIDE"
