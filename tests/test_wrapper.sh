@@ -585,6 +585,46 @@ code=$?
 set -e
 [[ $code -eq 0 && "$out" == "a real plan" ]] && ok "non-empty output exits 0 with content" || ko "non-empty path broke: code=$code out='$out'"
 
+# ---- streaming timeout flags: idle guard always on, total cap is a backstop ----
+# Stub records curl's argv, then emits a minimal SSE so the call exits 0.
+ARGCAP="$TMP/curl_args.txt"
+cat > "$SHIM_BIN/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$ARGCAP"
+while [[ \$# -gt 0 ]]; do case "\$1" in -D) printf 'HTTP/1.1 200 OK\r\n\r\n' > "\$2"; shift ;; esac; shift; done
+printf 'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"completion_tokens":1,"prompt_tokens":1}}\ndata: [DONE]\n\n'
+EOF
+chmod +x "$SHIM_BIN/curl"
+has_arg() { grep -qx -- "$1" "$ARGCAP"; }
+
+echo "== test 43: streaming default = idle guard on + 1800s backstop =="
+rm -f "$ARGCAP"
+env $PROF PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "stream this" >/dev/null 2>&1 || true
+has_arg "--speed-time" && ok "idle guard --speed-time present" || ko "idle guard missing"
+has_arg "30" && ok "default stall window 30s" || ko "stall window wrong"
+has_arg "--max-time" && has_arg "1800" && ok "default backstop --max-time 1800" || ko "default backstop wrong: $(tr '\n' ' ' < "$ARGCAP")"
+
+echo "== test 43b: MAESTRODE_STREAM_TIMEOUT=0 removes the total cap (ends on stream EOF) =="
+rm -f "$ARGCAP"
+env $PROF MAESTRODE_STREAM_TIMEOUT=0 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "stream this" >/dev/null 2>&1 || true
+has_arg "--speed-time" && ok "idle guard still on with no total cap" || ko "idle guard dropped"
+! has_arg "--max-time" && ok "no --max-time when STREAM_TIMEOUT=0" || ko "--max-time leaked at 0: $(tr '\n' ' ' < "$ARGCAP")"
+
+echo "== test 44: MAESTRODE_STREAM_TIMEOUT sets the backstop cap =="
+rm -f "$ARGCAP"
+env $PROF MAESTRODE_STREAM_TIMEOUT=120 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "stream this" >/dev/null 2>&1 || true
+has_arg "--max-time" && has_arg "120" && ok "STREAM_TIMEOUT=120 -> --max-time 120" || ko "backstop not applied: $(tr '\n' ' ' < "$ARGCAP")"
+
+echo "== test 45: MAESTRODE_STALL_TIMEOUT tunes the idle window =="
+rm -f "$ARGCAP"
+env $PROF MAESTRODE_STALL_TIMEOUT=10 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "stream this" >/dev/null 2>&1 || true
+has_arg "--speed-time" && has_arg "10" && ok "STALL_TIMEOUT=10 -> --speed-time 10" || ko "stall window not applied: $(tr '\n' ' ' < "$ARGCAP")"
+
+echo "== test 46: MAESTRODE_CURL_TIMEOUT still feeds the stream backstop =="
+rm -f "$ARGCAP"
+env $PROF MAESTRODE_CURL_TIMEOUT=300 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "stream this" >/dev/null 2>&1 || true
+has_arg "--max-time" && has_arg "300" && ok "CURL_TIMEOUT=300 inherited as backstop" || ko "CURL_TIMEOUT not inherited: $(tr '\n' ' ' < "$ARGCAP")"
+
 echo
 echo "==== $PASS passed, $FAIL failed ===="
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

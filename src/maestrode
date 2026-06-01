@@ -86,7 +86,13 @@
 #                            MAESTRODE_ULTRA_CONTEXT_LIMIT / MAESTRODE_BRAIN_CONTEXT_LIMIT.
 #   MAESTRODE_CONTEXT_MARGIN headroom left for the clamp; default: 1024 tokens
 #   MAESTRODE_PROTOCOL       openai|anthropic; default auto from endpoint path
-#   MAESTRODE_CURL_TIMEOUT   default: 600 (seconds)
+#   MAESTRODE_CURL_TIMEOUT   total cap for the bounded non-stream calls (warmup,
+#                            tool loop); default: 600 (seconds)
+#   MAESTRODE_STREAM_TIMEOUT total backstop for the streaming path; default: 1800.
+#                            0 = no cap, end exactly when the stream does (the idle
+#                            guard still aborts a wedge). Falls back to CURL_TIMEOUT.
+#   MAESTRODE_STALL_TIMEOUT  streaming idle guard: abort if no bytes flow for this
+#                            many seconds; default: 30
 #   MAESTRODE_ALLOW_SECRETS  set to 1 to bypass the secret-pattern scan
 #
 # exit codes:
@@ -576,6 +582,17 @@ else
   CONTEXT_LIMIT="${MAESTRODE_CONTEXT_LIMIT:-}"
 fi
 CONTEXT_MARGIN="${MAESTRODE_CONTEXT_MARGIN:-1024}"
+
+# Streaming timeouts. A streaming call already tells us EXACTLY when it is done:
+# the SSE terminal event ends the stream and curl exits 0. So the idle guard
+# (--speed-time/--speed-limit: abort if bytes stop flowing for STALL_TIMEOUT s) is
+# the real stall detector, and the total wall-clock cap is only a backstop. A fixed
+# total cap that is too low kills a healthy, still-streaming long plan (and the
+# retry then restarts from scratch, discarding the partial). So the stream path uses
+# a generous backstop by default; STREAM_TIMEOUT=0 disables it entirely (idle guard
+# only). The bounded non-stream paths (warmup, tool loop) keep MAESTRODE_CURL_TIMEOUT.
+STALL_TIMEOUT="${MAESTRODE_STALL_TIMEOUT:-30}"
+STREAM_TIMEOUT="${MAESTRODE_STREAM_TIMEOUT:-${MAESTRODE_CURL_TIMEOUT:-1800}}"
 
 # Protocol select (post-profile): .../v1/messages speaks the Anthropic Messages
 # API, everything else OpenAI Chat Completions. Override with MAESTRODE_PROTOCOL.
@@ -1266,11 +1283,13 @@ HTTP_CODE=""
 while true; do
   : > "$RESP_FILE"
   : > "$HDRS_FILE"
+  # Idle guard is always on; the total cap is a backstop, omitted when
+  # STREAM_TIMEOUT=0 so a healthy stream runs until its terminal event (exit 0).
+  stream_curl_opts=( --connect-timeout 10 --speed-time "$STALL_TIMEOUT" --speed-limit 1 )
+  [[ "$STREAM_TIMEOUT" != "0" ]] && stream_curl_opts+=( --max-time "$STREAM_TIMEOUT" )
   set +e
   curl --no-buffer -sS \
-    --connect-timeout 10 \
-    --speed-time 30 --speed-limit 1 \
-    --max-time "${MAESTRODE_CURL_TIMEOUT:-600}" \
+    "${stream_curl_opts[@]}" \
     -D "$HDRS_FILE" \
     -X POST "$ENDPOINT" \
     "${CURL_HEADERS[@]}" \
@@ -1280,9 +1299,10 @@ while true; do
   set -e
   HTTP_CODE=$(awk 'NR==1 {print $2; exit}' "$HDRS_FILE" 2>/dev/null || echo "")
 
-  # curl exit 28 = total --max-time hit OR idle abort via --speed-time.
-  # Treat as transient and retry with backoff. This is the "stuck for 10 min"
-  # fix: --speed-time 30 means a wedged stream dies in 30s, not 600s.
+  # curl exit 28 = idle abort via --speed-time (bytes stopped for STALL_TIMEOUT s)
+  # or, if a backstop is set, the STREAM_TIMEOUT total cap. With the idle guard a
+  # wedged stream dies in STALL_TIMEOUT s, not at the backstop. Treat as transient
+  # and retry with backoff.
   if [[ "$CURL_EXIT" == "28" ]]; then
     if [[ $attempt -ge $MAX_RETRIES ]]; then
       echo "maestrode: stream stalled (curl exit 28) after $MAX_RETRIES retries" >&2
