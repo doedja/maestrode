@@ -260,6 +260,260 @@ set -e
 [[ ! -f "$OUTDIR/cut.py" ]] && ok "unclosed block not written" || ko "unclosed block leaked"
 [[ "$err" == *"opened but not closed"* ]] && ok "unclosed-block diagnostic surfaced" || ko "no unclosed diagnostic: $err"
 
+# ---- Anthropic Messages protocol (zen minimax/qwen path) ----
+# Swap the curl stub for one that captures the request body and emits an
+# Anthropic Messages SSE stream from a fixture, so the anthropic branch of the
+# parser + payload builder is exercised end-to-end with no network.
+REQ_CAP="$TMP/anthropic_req.json"
+ANTHRO_FIX="$TMP/anthropic_fix.json"
+cat > "$SHIM_BIN/curl" <<EOF
+#!/usr/bin/env bash
+ANTHRO_FIX="$ANTHRO_FIX"
+REQ_CAP="$REQ_CAP"
+hdrs=""; body=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    -D) hdrs="\$2"; shift 2 ;;
+    --data-binary) body="\${2#@}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ -n "\$body" && -f "\$body" ]] && cp "\$body" "\$REQ_CAP"
+[[ -n "\$hdrs" ]] && printf 'HTTP/1.1 200 OK\r\n\r\n' > "\$hdrs"
+python3 - "\$ANTHRO_FIX" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+def ev(t, obj):
+    obj["type"] = t
+    sys.stdout.write("event: " + t + "\n")
+    sys.stdout.write("data: " + json.dumps(obj) + "\n\n")
+ev("message_start", {"message": {"model": "minimax-m3",
+    "usage": {"input_tokens": d.get("input_tokens", 10),
+              "cache_read_input_tokens": d.get("cache_read_input_tokens", 0)}}})
+ev("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}})
+if d.get("thinking"):
+    ev("content_block_delta", {"index": 0, "delta": {"type": "thinking_delta", "thinking": d["thinking"]}})
+if d.get("content"):
+    ev("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": d["content"]}})
+ev("content_block_stop", {"index": 0})
+ev("message_delta", {"delta": {"stop_reason": d.get("stop_reason", "end_turn")},
+                     "usage": {"output_tokens": d.get("output_tokens", 20)}})
+ev("message_stop", {})
+PY
+EOF
+chmod +x "$SHIM_BIN/curl"
+
+echo "== test 19: anthropic protocol request shape (system top-level, no stream_options) =="
+cat > "$ANTHRO_FIX" <<'JEOF'
+{"content":"hello from anthropic","stop_reason":"end_turn","input_tokens":12,"output_tokens":5}
+JEOF
+out=$(MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --system "be terse" "hi" 2>/dev/null)
+[[ "$out" == "hello from anthropic" ]] && ok "anthropic content delivered" || ko "anthropic content wrong: '$out'"
+python3 -c "
+import json
+p=json.load(open('$REQ_CAP'))
+assert p.get('system')=='be terse', 'system not top-level'
+assert 'stream_options' not in p, 'stream_options leaked'
+assert p.get('max_tokens'), 'max_tokens missing'
+assert all(m['role']!='system' for m in p['messages']), 'system role in messages'
+" >/dev/null 2>&1 && ok "anthropic payload shape correct" || ko "anthropic payload shape wrong"
+
+echo "== test 20: anthropic endpoint auto-detect from /messages path =="
+cat > "$ANTHRO_FIX" <<'JEOF'
+{"content":"auto detected","stop_reason":"end_turn","input_tokens":1,"output_tokens":1}
+JEOF
+out=$(MAESTRODE_ENDPOINT="https://x.test/v1/messages" PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --system "s" "hi" 2>/dev/null)
+[[ "$out" == "auto detected" ]] && ok "/messages auto-selected anthropic" || ko "auto-detect failed: '$out'"
+python3 -c "
+import json
+p=json.load(open('$REQ_CAP'))
+assert p.get('system')=='s' and 'stream_options' not in p
+" >/dev/null 2>&1 && ok "auto-detect produced anthropic payload" || ko "auto-detect payload wrong"
+
+echo "== test 21: anthropic thinking_delta routes to reasoning, content stays clean =="
+cat > "$ANTHRO_FIX" <<'JEOF'
+{"content":"final answer","thinking":"secret reasoning here","stop_reason":"end_turn","input_tokens":12,"output_tokens":5}
+JEOF
+out=$(MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "q" 2>/dev/null)
+[[ "$out" == "final answer" ]] && ok "content clean (reasoning not leaked)" || ko "reasoning leaked into content: '$out'"
+full=$(MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --full "q" 2>/dev/null)
+[[ "$full" == *"secret reasoning here"* ]] && ok "reasoning surfaced under --full" || ko "reasoning missing under --full"
+
+echo "== test 22: anthropic inline <think> in text channel stripped (minimax case) =="
+cat > "$ANTHRO_FIX" <<'JEOF'
+{"content":"<think>deliberating out loud</think>clean output","stop_reason":"end_turn","input_tokens":1,"output_tokens":1}
+JEOF
+out=$(MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "q" 2>/dev/null)
+[[ "$out" == "clean output" ]] && ok "inline think stripped from content" || ko "think leaked: '$out'"
+
+echo "== test 23: anthropic stop_reason=max_tokens maps to length =="
+cat > "$ANTHRO_FIX" <<'JEOF'
+{"content":"partial","stop_reason":"max_tokens","input_tokens":12,"output_tokens":5}
+JEOF
+err=$(MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "q" 2>&1 >/dev/null)
+[[ "$err" == *"finish=length"* ]] && ok "max_tokens -> length in stat line" || ko "length map missing: $err"
+[[ "$err" == *"cut by max_tokens"* ]] && ok "truncation warning surfaced" || ko "no truncation warning"
+
+echo "== test 24: --think sends MiniMax adaptive thinking (anthropic) =="
+cat > "$ANTHRO_FIX" <<'JEOF'
+{"content":"x","stop_reason":"end_turn","input_tokens":1,"output_tokens":1}
+JEOF
+MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --think "q" >/dev/null 2>&1
+python3 -c "
+import json
+p=json.load(open('$REQ_CAP'))
+assert p.get('thinking')=={'type':'adaptive'}, p.get('thinking')
+" >/dev/null 2>&1 && ok "--think -> thinking type=adaptive (no budget)" || ko "--think payload wrong"
+
+echo "== test 25: --thinking-budget sends Anthropic enabled+budget =="
+MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --thinking-budget 1500 "q" >/dev/null 2>&1
+python3 -c "
+import json
+p=json.load(open('$REQ_CAP'))
+t=p.get('thinking') or {}
+assert t.get('type')=='enabled' and t.get('budget_tokens')==1500, t
+" >/dev/null 2>&1 && ok "--thinking-budget -> enabled + budget_tokens" || ko "budget payload wrong"
+
+echo "== test 26: --thinking-type overrides the default =="
+MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --thinking-type disabled --think "q" >/dev/null 2>&1
+python3 -c "
+import json
+p=json.load(open('$REQ_CAP'))
+assert (p.get('thinking') or {}).get('type')=='disabled', p.get('thinking')
+" >/dev/null 2>&1 && ok "--thinking-type wins" || ko "thinking-type override failed"
+
+echo "== test 27: env file is defaults, caller env wins (no clobber) =="
+# env file pins one model; caller exports another. Caller must win.
+echo 'MAESTRODE_API_KEY=test-key-not-real' > "$MAESTRODE_CONFIG_DIR/env"
+echo 'MAESTRODE_MODEL=file-model' >> "$MAESTRODE_CONFIG_DIR/env"
+MAESTRODE_PROTOCOL=anthropic MAESTRODE_MODEL=caller-model \
+  PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "q" >/dev/null 2>&1
+python3 -c "
+import json
+p=json.load(open('$REQ_CAP'))
+assert p.get('model')=='caller-model', p.get('model')
+" >/dev/null 2>&1 && ok "caller MAESTRODE_MODEL overrides env file" || ko "env file clobbered caller override"
+
+# ---- --tools agentic write_file loop (maestrode ultra) ----
+# Stub curl to return canned NON-streaming Anthropic responses, one per call,
+# counted via a file. Exercises the full tool loop: tool_use -> write -> result
+# -> re-call, terminating when stop_reason flips to end_turn.
+CNT="$TMP/tool_call_count"
+RESPDIR="$TMP/tool_resps"; mkdir -p "$RESPDIR"
+cat > "$SHIM_BIN/curl" <<EOF
+#!/usr/bin/env bash
+CNT="$CNT"; RESPDIR="$RESPDIR"
+hdrs=""
+while [[ \$# -gt 0 ]]; do case "\$1" in -D) hdrs="\$2"; shift 2 ;; *) shift ;; esac; done
+n=\$(cat "\$CNT" 2>/dev/null || echo 0); n=\$((n+1)); echo "\$n" > "\$CNT"
+[[ -n "\$hdrs" ]] && printf 'HTTP/1.1 200 OK\r\n\r\n' > "\$hdrs"
+cat "\$RESPDIR/\$n.json"
+EOF
+chmod +x "$SHIM_BIN/curl"
+
+echo "== test 28: --tools agentic loop writes multiple files then stops =="
+echo 0 > "$CNT"
+cat > "$RESPDIR/1.json" <<'JEOF'
+{"content":[{"type":"thinking","thinking":"plan the files","signature":"sig1"},{"type":"tool_use","id":"t1","name":"write_file","input":{"path":"a.py","content":"print('a')"}}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":2}}
+JEOF
+cat > "$RESPDIR/2.json" <<'JEOF'
+{"content":[{"type":"tool_use","id":"t2","name":"write_file","input":{"path":"sub/b.py","content":"print('b')"}}],"stop_reason":"tool_use","usage":{"input_tokens":12,"output_tokens":6}}
+JEOF
+cat > "$RESPDIR/3.json" <<'JEOF'
+{"content":[{"type":"text","text":"all done"}],"stop_reason":"end_turn","usage":{"input_tokens":14,"output_tokens":3}}
+JEOF
+TOOLDIR="$TMP/tools_out"; rm -rf "$TOOLDIR"
+MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --tools --files "$TOOLDIR" "write a and b" >/dev/null 2>&1 || true
+[[ -f "$TOOLDIR/a.py" ]] && ok "tool wrote a.py" || ko "a.py missing"
+[[ -f "$TOOLDIR/sub/b.py" ]] && ok "tool wrote nested sub/b.py" || ko "sub/b.py missing"
+[[ "$(cat "$TOOLDIR/a.py" 2>/dev/null)" == "print('a')" ]] && ok "a.py content correct" || ko "a.py content wrong"
+[[ "$(cat "$CNT")" == "3" ]] && ok "loop ran 3 iters then stopped on end_turn" || ko "wrong iter count: $(cat "$CNT")"
+
+echo "== test 29: --tools requires --files =="
+set +e
+MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --tools "x" >/dev/null 2>&1
+code=$?
+set -e
+[[ $code -eq 64 ]] && ok "exit 64 without --files" || ko "wrong exit: $code"
+
+echo "== test 30: --tools drives OpenAI tool_calls loop (kimi path) =="
+echo 0 > "$CNT"
+cat > "$RESPDIR/1.json" <<'JEOF'
+{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"write_file","arguments":"{\"path\": \"oa.py\", \"content\": \"print(1)\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+JEOF
+cat > "$RESPDIR/2.json" <<'JEOF'
+{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":2}}
+JEOF
+OADIR="$TMP/oa_out"; rm -rf "$OADIR"
+MAESTRODE_PROTOCOL=openai PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --tools --files "$OADIR" "write oa" >/dev/null 2>&1 || true
+[[ -f "$OADIR/oa.py" ]] && ok "openai tool_calls wrote oa.py" || ko "oa.py missing"
+[[ "$(cat "$OADIR/oa.py" 2>/dev/null)" == "print(1)" ]] && ok "oa.py content correct" || ko "oa.py content wrong"
+[[ "$(cat "$CNT")" == "2" ]] && ok "openai loop ran 2 iters then stopped on finish=stop" || ko "wrong iter count: $(cat "$CNT")"
+
+echo "== test 31: --tools refuses unsafe write_file path =="
+echo 0 > "$CNT"
+cat > "$RESPDIR/1.json" <<'JEOF'
+{"content":[{"type":"tool_use","id":"t1","name":"write_file","input":{"path":"../escape.py","content":"bad"}},{"type":"tool_use","id":"t2","name":"write_file","input":{"path":"ok.py","content":"good"}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}
+JEOF
+cat > "$RESPDIR/2.json" <<'JEOF'
+{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}
+JEOF
+TOOLDIR2="$TMP/tools_out2"; rm -rf "$TOOLDIR2"
+MAESTRODE_PROTOCOL=anthropic PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --tools --files "$TOOLDIR2" "x" >/dev/null 2>&1 || true
+[[ -f "$TOOLDIR2/ok.py" ]] && ok "safe path written in tool mode" || ko "safe path missing"
+[[ ! -f "$TMP/escape.py" ]] && ok "unsafe ../ path refused in tool mode" || ko "unsafe path leaked"
+
+# ---- mode profiles (--ultra / --brain / overrides) ----
+# Smart stub: captures the request, returns JSON for non-stream (tool) calls and
+# SSE for streaming, so both the tool path and the stream path terminate cleanly.
+cat > "$SHIM_BIN/curl" <<EOF
+#!/usr/bin/env bash
+body=""
+while [[ \$# -gt 0 ]]; do case "\$1" in --data-binary) body="\${2#@}"; cp "\$body" "$REQ_CAP" 2>/dev/null ;; -D) printf 'HTTP/1.1 200 OK\r\n\r\n' > "\$2"; shift ;; esac; shift; done
+if grep -q '"stream": *false' "\$body" 2>/dev/null; then
+  echo '{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],"usage":{}}'
+else
+  printf 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{}}\ndata: [DONE]\n\n'
+fi
+EOF
+chmod +x "$SHIM_BIN/curl"
+PROF="MAESTRODE_MODEL=normal-m MAESTRODE_ENDPOINT=https://x/v1/chat/completions \
+MAESTRODE_BRAIN_MODEL=brain-m MAESTRODE_BRAIN_ENDPOINT=https://x/v1/messages \
+MAESTRODE_ULTRA_MODEL=ultra-m MAESTRODE_ULTRA_ENDPOINT=https://x/v1/chat/completions"
+field() { python3 -c "import json;p=json.load(open('$REQ_CAP'));print($1)" 2>/dev/null; }
+
+echo "== test 32: default uses normal muscle, no tools =="
+rm -f "$REQ_CAP"
+env $PROF PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --files "$TMP/m0" "x" >/dev/null 2>&1 || true
+[[ "$(field "p['model']")" == "normal-m" ]] && ok "normal model resolved" || ko "normal model wrong: $(field "p['model']")"
+[[ "$(field "'tools' in p")" == "False" ]] && ok "normal has no tools" || ko "normal leaked tools"
+
+echo "== test 33: --ultra uses ultra muscle + tools + reasoning none =="
+rm -f "$REQ_CAP"
+env $PROF PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --ultra --files "$TMP/m1" "x" >/dev/null 2>&1 || true
+[[ "$(field "p['model']")" == "ultra-m" ]] && ok "ultra model resolved" || ko "ultra model wrong: $(field "p['model']")"
+[[ "$(field "'tools' in p")" == "True" ]] && ok "ultra enables tools" || ko "ultra missing tools"
+[[ "$(field "p.get('reasoning_effort')")" == "none" ]] && ok "ultra reasoning=none" || ko "ultra reasoning wrong: $(field "p.get('reasoning_effort')")"
+
+echo "== test 34: --brain uses brain model, anthropic, NO auto-thinking =="
+rm -f "$REQ_CAP"
+env $PROF PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --brain "plan x" >/dev/null 2>&1 || true
+[[ "$(field "p['model']")" == "brain-m" ]] && ok "brain model resolved" || ko "brain model wrong: $(field "p['model']")"
+# brain reasons into plan text; thinking must NOT be auto-enabled (it would
+# burn the token budget before the plan content is written).
+[[ "$(field "'thinking' in p")" == "False" ]] && ok "brain does not auto-enable thinking" || ko "brain leaked thinking: $(field "p.get('thinking')")"
+[[ "$(field "'stream_options' in p")" == "False" ]] && ok "brain payload is anthropic-shaped" || ko "brain not anthropic"
+
+echo "== test 34b: MAESTRODE_BRAIN_THINK=1 opts back into thinking =="
+rm -f "$REQ_CAP"
+env $PROF MAESTRODE_BRAIN_THINK=1 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --brain "plan x" >/dev/null 2>&1 || true
+[[ "$(field "(p.get('thinking') or {}).get('type')")" == "adaptive" ]] && ok "BRAIN_THINK=1 enables thinking" || ko "opt-in thinking failed: $(field "p.get('thinking')")"
+
+echo "== test 35: --model overrides the profile =="
+rm -f "$REQ_CAP"
+env $PROF PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --ultra --model my-override --files "$TMP/m2" "x" >/dev/null 2>&1 || true
+[[ "$(field "p['model']")" == "my-override" ]] && ok "--model overrides ultra profile" || ko "override failed: $(field "p['model']")"
+
 echo
 echo "==== $PASS passed, $FAIL failed ===="
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

@@ -1,38 +1,90 @@
 ---
 name: maestrode
 description: >
-  Delegation mode for code work. Claude (brain) plans, reads, decides,
-  reviews, applies, runs tests, iterates. DeepSeek V4 Flash (muscle, via
-  the `maestrode` shim) drafts code, prose, configs, multi-file patches.
-  Stays on across the session via session-scoped hooks until "maestrode
-  off". Triggers: "maestrode on", "maestrode mode", "use maestrode",
-  "/maestrode", or any user request to route work through the cheap
-  muscle model.
+  Delegation modes for code work (Claude Code only). Three modes: NORMAL
+  (default) opus plans, cheap muscle drafts, opus audits; HIGH a brain model
+  plans, muscle drafts, opus audits; ULTRA brain plans, premium tool-calling
+  muscle drafts, opus audits with independent spec-tests. Models are config-
+  driven via ~/.config/maestrode/env (model-agnostic). Stays on across the
+  session via session-scoped hooks until "maestrode off". Triggers: "maestrode
+  on", "maestrode high", "maestrode ultra", "maestrode mode", "use maestrode",
+  "/maestrode", or any request to route work through maestrode.
 ---
 
-# maestrode mode
+# maestrode modes
 
-**Default action for any code, prose, or config draft: delegate to muscle.**
+Claude Code only. Three escalating modes, set by the user's words and tracked
+by the session hook (the banner each turn tells you which is active):
+
+| mode | brain (plans) | muscle (drafts) | you (opus) | use for |
+|------|---------------|-----------------|------------|---------|
+| **normal** (default) | **you** | `maestrode --files` | plan + audit | small / architecture-sensitive; you keep control |
+| **high** | `maestrode --brain` | `maestrode --files` | audit only | routine bulk work; offload planning too |
+| **ultra** | `maestrode --brain` | `maestrode --ultra --files` | audit + spec-test | gnarly / algorithmic work where craft matters |
+
+Models are config-driven (`~/.config/maestrode/env`): a default muscle, a
+`--brain` planner, a `--ultra` tool muscle. Locally: deepseek (normal/high
+muscle), minimax (brain), kimi tool-calling (ultra muscle). Swap freely.
+
+**The constant rule in every mode: do not author code/prose/config yourself.**
+Direct Edit / Write only to apply muscle output, for a one-line tweak, when the
+user said do it yourself, or for an architecture / security call you must own.
+If your next tool call is Edit/Write and none of those apply, you skipped a
+delegation. What changes per mode is *who plans* and *which muscle*, never that
+you draft by hand.
+
+## Orchestration per mode
+
+**normal**: you plan in-context, delegate only the drafting.
 
     maestrode -f <files> --files out/ "<brief>"
 
-Direct Edit / Write only for: applying muscle's output, one-line tweaks,
-the user said do it yourself, or an architecture / security call the
-brain must own. If your next tool call is Edit or Write and none of those
-apply, you skipped a delegation.
+**high / ultra**: offload planning to the brain too, then draft, then audit.
+
+    # 1. plan (brain model returns a written plan + edge cases, not files)
+    maestrode --brain "Plan <task>. Enumerate the algorithm and EVERY edge case." > /tmp/plan.md
+
+    # 2. draft (muscle implements the plan)
+    maestrode --files out/ "Implement this plan. <brief>. PLAN: $(cat /tmp/plan.md)"        # high
+    maestrode --ultra --files out/ "Implement this plan. <brief>. PLAN: $(cat /tmp/plan.md)" # ultra
+
+    # 3. audit (you): see "Ultra/high audit" below
+
+`--ultra` auto-enables the tool-calling muscle with reasoning off (the brain
+already reasoned). `--brain` runs the planner so it reasons straight into the
+plan text (no separate thinking channel, which would burn the budget before the
+plan is written). Both are env-driven, so this stays model-agnostic.
+
+## Ultra/high audit: independent tests, never the muscle's own
+
+The muscle writes tests that pass against *its own* bugs (it grades its own
+homework). So the audit MUST use tests the muscle did not write:
+
+1. Derive the test cases from the SPEC (or have `--brain` emit them), not from
+   the muscle's output.
+2. Run them against the draft. On failure, feed the real failure back to the
+   muscle (high: `maestrode --files`; ultra: `maestrode --ultra --files`) and
+   re-run. Keep already-passing cases as anchors so a fix cannot regress them.
+3. Only apply once your independent tests pass. ultra adds this loop because
+   it is used for the hard tasks where muscle bugs hide.
+
+Muscle craft is plan-dependent: a strict `--brain` plan yields clean code; a
+vague one yields fragile code (dead guards, panics/unwraps, spec-drift). Spend
+the tokens on a thorough plan.
 
 ## Persistence is hook-driven (you do not have to self-remind)
 
 The installer registers three Claude Code hooks that key all state to
 `session_id` under `~/.config/maestrode/sessions/<session_id>`:
 
-- **UserPromptSubmit** captures "maestrode on" / "off" from your words,
-  then injects a one-line `[maestrode ON]` banner into your context every
-  turn while active. That banner is the continuous trigger, pushed by the
-  harness, so the mode cannot silently fade the way a brain-emitted footer
-  tag did. When you drift (cold direct edits or subagent spawns piling up
-  without a delegation), the banner escalates to `[maestrode ON, drift]`
-  with the count.
+- **UserPromptSubmit** captures the mode from your words ("maestrode on" =
+  normal, "maestrode high", "maestrode ultra", "maestrode off") and injects a
+  mode-specific banner (`[maestrode NORMAL|HIGH|ULTRA]`) into your context every
+  turn while active. The banner states that mode's orchestration (who plans,
+  which muscle), so you cannot drift off-mode the way a brain-emitted footer tag
+  faded. Switching modes mid-session just re-says it and resets drift. When you
+  drift (cold direct edits or subagent spawns piling up without a delegation),
+  the banner escalates to `[maestrode <MODE>, drift]` with the count.
 - **PreToolUse** (`Edit|Write|MultiEdit|NotebookEdit|Task|Bash`) does the
   bookkeeping behind that drift count and resets it whenever you make a real
   `maestrode ...` call.
@@ -79,18 +131,20 @@ NOT inherit this mode: it never sees this skill. Two rules:
 
 ## The shim, in one screen
 
-`maestrode` (binary on PATH) posts to any OpenAI-compatible Chat
-Completions endpoint. Config at `~/.config/maestrode/env`. Default model
+`maestrode` (binary on PATH) posts to OpenAI-compatible Chat Completions OR
+Anthropic Messages endpoints (auto-detected from the URL). Config at
+`~/.config/maestrode/env`. Models are config-driven; locally the muscle is
 `deepseek-v4-flash`.
 
 ```bash
-maestrode -f src/foo.py "extract validator"
-{ echo "task:"; cat spec.md; } | maestrode
+maestrode -f src/foo.py "extract validator"          # normal muscle
+maestrode --files out/ "<brief emitting <<<FILE:>>> blocks>"
+maestrode --brain "Plan X. List every edge case."     # planner (high/ultra)
+maestrode --ultra --files out/ "<implement the plan>" # tool muscle (ultra)
 maestrode --session arm-b --system "Senior engineer." "first ask"
-maestrode --files out/ "<brief that emits <<<FILE:>>> blocks>"
 ```
 
-`--files DIR` parses delimited blocks and writes each file:
+`--files DIR` parses delimited blocks (normal/high) and writes each file:
 
 ```
 <<<FILE: path/to/file.py>>>
@@ -98,9 +152,10 @@ content
 <<<END FILE>>>
 ```
 
-Unsafe paths (absolute or `..`) refused. Exit codes: **3** rate limit,
-**4** no blocks parsed (often format collision), **5** muscle refused
-via `<<<NEEDS_SMART>>>`.
+`--ultra` instead runs an agentic `write_file` tool loop (the muscle calls a
+real tool, not text blocks) for tool-native models; same DIR, same safe-path
+rules. Unsafe paths (absolute or `..`) refused. Exit codes: **3** rate limit,
+**4** no blocks/files produced, **5** muscle refused via `<<<NEEDS_SMART>>>`.
 
 `maestrode gain` shows aggregate usage from `~/.config/maestrode/usage.jsonl`.
 Mention it when the user asks about offloaded work.

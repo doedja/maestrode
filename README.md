@@ -1,23 +1,40 @@
 # maestrode
 
-**Cuts your Claude usage by ~80%.** Smart model thinks, cheap model writes. Measured on real tasks, no quality loss on spec-driven work.
+**Claude Code delegation modes. Claude plans and audits, cheaper models do the drafting.** Cuts your Claude usage ~80% on spec-driven code work, no quality loss.
 
-| your brain | Claude tokens per task | Claude usage cut |
+| your brain | Claude tokens per task | usage cut |
 |---|---|---|
-| Claude Opus 4.7 | ~30k → ~4k | **~87%** |
-| Claude Sonnet 4.7 | ~30k → ~5k | **~83%** |
+| Claude Opus | ~30k → ~4k | **~87%** |
+| Claude Sonnet | ~30k → ~5k | **~83%** |
 
-If you're on a subscription tier, this means more work fits inside the same quota (or you drop a tier and stop paying for headroom you don't need). If you're on API billing, the same percentage shows up as a smaller invoice.
+Claude is uniquely good at one of the two jobs per turn: thinking. Writing file contents is interchangeable. maestrode keeps Claude as the brain (plan, review, iterate) and routes the drafting to a cheap OpenAI-compatible or Anthropic-compatible model via a bash shim. A session-scoped hook keeps the mode on across turns so it never silently fades.
 
-Claude (or any expensive frontier model) plans, reads, decides, reviews, iterates. DeepSeek V4 Flash (or any OpenAI-compatible cheap model) writes the actual file contents. A 300-line bash shim handles delegation, structured failure feedback, multi-turn sessions, multi-file output, and KV-cache reuse.
+## Three modes
 
-## Why I built this
+Set by what you say in Claude Code. The hook re-injects a banner each turn so the mode sticks.
 
-I was on Claude Max 20x but never hit the ceiling. The price felt steep for headroom I wasn't using.
+| mode | brain (plans) | muscle (drafts) | Claude does | use for |
+|------|---------------|-----------------|-------------|---------|
+| **normal** (default) | Claude | cheap muscle | plan + audit | small / architecture-sensitive work |
+| **high** | brain model | cheap muscle | audit only | routine bulk work; offload planning too |
+| **ultra** | brain model | tool-calling muscle | audit + spec-test | gnarly / algorithmic work where craft matters |
 
-Claude does two jobs per turn: thinking and writing. Thinking is what frontier models are uniquely good at. Writing is interchangeable. So I wired Claude as the brain and DeepSeek V4 Flash as the muscle, benchmarked it 10 ways, and confirmed quality holds on spec-driven work. Where flash falls down, the brief was sloppy, not the model. Back on the smaller tier now, the muscle calls are basically free.
+Only **normal** spends Claude tokens on planning. **high** and **ultra** hand planning to a cheaper "brain" model too, so Claude only reviews. **ultra** adds a tool-calling muscle (the model writes files through a real `write_file` tool, not text blocks) and an independent spec-test loop for the hard tasks.
 
-This repo is the wrapper + skill that made it work, plus the measurements.
+Models are config-driven, so it stays model-agnostic. A sensible local setup:
+
+```bash
+# ~/.config/maestrode/env
+MAESTRODE_API_KEY=sk-...
+MAESTRODE_MODEL=deepseek-v4-flash                                 # normal/high muscle
+MAESTRODE_ENDPOINT=https://opencode.ai/zen/go/v1/chat/completions
+MAESTRODE_BRAIN_MODEL=minimax-m3                                  # high/ultra planner
+MAESTRODE_BRAIN_ENDPOINT=https://opencode.ai/zen/go/v1/messages
+MAESTRODE_ULTRA_MODEL=kimi-k2.6                                   # ultra tool muscle
+MAESTRODE_ULTRA_ENDPOINT=https://opencode.ai/zen/go/v1/chat/completions
+```
+
+Swap any model for whatever your endpoint serves. The shim auto-detects OpenAI Chat Completions vs Anthropic Messages from the endpoint path.
 
 ## Quickstart
 
@@ -33,81 +50,28 @@ Install on Windows (PowerShell, no admin needed):
 iwr -useb https://raw.githubusercontent.com/doedja/maestrode/main/install.ps1 | iex
 ```
 
-Windows prereqs: Git for Windows (`winget install Git.Git`, provides `bash`) and Python 3 (`winget install Python.Python.3.12`). The installer drops a `maestrode.cmd` shim so the command runs from cmd / PowerShell / Windows Terminal without needing to open Git Bash.
+Windows prereqs: Git for Windows (`winget install Git.Git`, provides `bash`) and Python 3 (`winget install Python.Python.3.12`). The installer drops a `maestrode.cmd` shim so it runs from cmd / PowerShell without opening Git Bash.
 
-Edit the env file with your API key:
+Then edit `~/.config/maestrode/env` (see above) and you're set.
 
-```bash
-# macOS / Linux / WSL / Git Bash
-nvim ~/.config/maestrode/env
-# MAESTRODE_API_KEY=sk-...
-# MAESTRODE_ENDPOINT=https://api.deepseek.com/v1/chat/completions
-```
+### Use it
 
-```powershell
-# Windows PowerShell
-notepad $env:USERPROFILE\.config\maestrode\env
-```
+In Claude Code, say **`maestrode on`** (normal), **`maestrode high`**, or **`maestrode ultra`**. The mode stays on for the rest of the session and Claude routes drafting to the muscle. Say **`maestrode off`** to drop back to direct authoring.
 
-Uninstall (removes binary + config + sessions + Claude skill, and scrubs any legacy hook left over from earlier versions):
+Persistence is hook-driven: the installer registers three Claude Code hooks (UserPromptSubmit, PreToolUse, SessionEnd) that key all state to `session_id`, so the active mode sticks across turns without the model remembering it and never leaks into another session. Opt out with `MAESTRODE_NO_HOOKS=1`.
+
+CLI direct (any harness): `maestrode --files out/ "<brief>"`, `maestrode --ultra --files out/ "<brief>"`, `maestrode --brain "<plan request>"`.
+
+Uninstall:
 
 ```bash
-# macOS / Linux / WSL
 curl -fsSL https://raw.githubusercontent.com/doedja/maestrode/main/install.sh | bash -s -- --uninstall
 # add --keep-config to keep ~/.config/maestrode
 ```
 
-```powershell
-# Windows: download then run with -Uninstall
-iwr -useb https://raw.githubusercontent.com/doedja/maestrode/main/install.ps1 -OutFile install.ps1
-.\install.ps1 -Uninstall
-# add -KeepConfig to keep $env:USERPROFILE\.config\maestrode
-```
+## Where to get the cheap models
 
-### Use it
-
-In Claude Code: say **`maestrode on`** or `/maestrode`. The mode stays on for the rest of the session; Claude delegates code-writing to the cheap muscle. Say `maestrode off` to drop back.
-
-Persistence is hook-driven. The installer registers three Claude Code hooks (UserPromptSubmit, PreToolUse, SessionEnd) that key all state to `session_id`, so the mode sticks across turns without the model having to remember it, and never leaks into another session. Opt out with `MAESTRODE_NO_HOOKS=1` for conversation-only mode.
-
-CLI direct: `maestrode "task"`. See `examples/quickstart.sh` for a 30-second runnable demo.
-
-## Where to get the cheap model
-
-If you don't already have a key, [OpenCode Go](https://opencode.ai/go?ref=RYMKY9AQS9) is the cheapest path I've found. $10/mo gets you ~$60 of DeepSeek V4 Flash + Pro + a bunch of other open-source models (GLM, Kimi, Qwen, MiniMax). That's what I used for all 10 benchmarks. (That's my referral link, fair warning. The non-ref URL is `opencode.ai/go`.)
-
-Or any OpenAI-compatible endpoint works:
-
-| provider | endpoint |
-|---|---|
-| DeepSeek direct | `https://api.deepseek.com/v1/chat/completions` |
-| OpenRouter | `https://openrouter.ai/api/v1/chat/completions` |
-| OpenCode Zen Go | `https://opencode.ai/zen/go/v1/chat/completions` |
-| ollama (local) | `http://localhost:11434/v1/chat/completions` |
-
-Set `MAESTRODE_API_KEY` and `MAESTRODE_ENDPOINT` in `~/.config/maestrode/env`.
-
-## When to use what
-
-| task shape | use |
-|---|---|
-| clear spec, multi-file, well-defined | maestrode (default) |
-| vague brief, ambiguous diagnosis | smart model directly, skip the cheap muscle |
-| cross-cutting refactor with API constraints | maestrode but review the muscle output |
-
-## Pairs well with
-
-- [rtk](https://www.rtk-ai.app/) (`brew install rtk`): token-compact rewrites of `ls`, `git`, `gh`, `tree`, `read` output. Not affiliated.
-- [caveman](https://github.com/JuliusBrussee/caveman) skill (Claude Code): ultra-compressed chat output to the user.
-
-**Stack all three (rtk + caveman + maestrode)** and Claude tokens drop across every layer: shell output (rtk), chat replies (caveman), code drafting (maestrode). No config needed, the skills know how to compose.
-
-## Feedback the shim gives you
-
-- **`[maestrode streaming ...]`** heartbeat every ~1s while the call streams in (content + reasoning char counters). The call is wired through SSE with `--connect-timeout 10` and `--speed-time 30 --speed-limit 1`, so a wedged stream dies in ~30s instead of running the full `MAESTRODE_CURL_TIMEOUT` (600s). Retries treat the stall as transient.
-- **`finish=length`** in the stderr stat line plus `response cut by max_tokens` warning when the model hit the cap. Raise `--max-tokens` (or split the brief).
-- **`N <<<FILE:>>> block(s) opened but not closed`** when `--files` parsing finds a truncated response. Closed blocks still get written; reissue the missing ones.
-- **Exit 5 (`NEEDS_SMART`)** when the cheap muscle decides the brief is too thin or the task exceeds its capability. Session + file writes are skipped. The brain takes over.
+[OpenCode Zen Go](https://opencode.ai/go?ref=RYMKY9AQS9) is the cheapest path I've found: $10/mo gets ~$60 of DeepSeek, MiniMax, Kimi, Qwen, GLM, all behind one key, on both the OpenAI and Anthropic endpoints maestrode uses. (Referral link; non-ref is `opencode.ai/go`.) Any OpenAI-compatible or Anthropic-compatible endpoint also works (DeepSeek direct, OpenRouter, ollama, the official Anthropic API).
 
 ## Aggregate stats
 
@@ -117,12 +81,19 @@ Every call appends a JSONL record to `~/.config/maestrode/usage.jsonl`.
 maestrode gain
 ```
 
-Prints totals (tokens by kind, per-model breakdown, wall time) over the full log. No price assumptions, no settings, no model-dependent fields. You read the raw numbers and infer the brain-cost-equivalent yourself.
+Prints totals (tokens by kind, per-model breakdown, wall time) over the full log. Read the raw numbers and infer the Claude-cost-equivalent yourself.
 
-## Caveats
+## Pairs well with
 
-- **Cheap model hallucinates on vague briefs.** Use the smart model directly for ambiguous diagnosis, or paste the actual assertion text when iterating.
-- **No streaming yet.** Responses come whole.
+- [rtk](https://www.rtk-ai.app/) (`brew install rtk`): token-compact rewrites of `ls`, `git`, `gh`, `tree`, `read` output.
+- [caveman](https://github.com/JuliusBrussee/caveman) skill: ultra-compressed chat output.
+
+Stack all three and Claude tokens drop at every layer: shell output (rtk), chat replies (caveman), code drafting (maestrode).
+
+## Notes
+
+- **Cheap models hallucinate on vague briefs.** Plan first (Claude in normal, the brain model in high/ultra), then delegate the draft. Garbage plan in, garbage code out.
+- **The muscle's own tests aren't a real check** (it grades its own homework). high/ultra audit with tests derived from the spec, not from the muscle's output.
 
 ## License
 

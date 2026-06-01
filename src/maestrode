@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # maestrode: shim that lets a smart model orchestrate a cheap one for code work.
 #
-# Reads from any OpenAI-compatible Chat Completions endpoint. Defaults are
-# tuned for DeepSeek V4 Flash, but it works against OpenRouter, OmniRoute,
-# OpenCode Zen, ollama, lmstudio, or the official DeepSeek API.
+# Reads from OpenAI-compatible Chat Completions OR Anthropic Messages endpoints.
+# Protocol is auto-picked from the endpoint path: a URL ending in /messages
+# speaks the Anthropic Messages API (e.g. OpenCode Zen's minimax/qwen models via
+# @ai-sdk/anthropic), everything else speaks OpenAI Chat Completions. Defaults
+# are tuned for DeepSeek V4 Flash, but it works against OpenRouter, OmniRoute,
+# OpenCode Zen, ollama, lmstudio, or the official DeepSeek/Anthropic APIs.
 #
 # usage:
 #   maestrode "prompt"
@@ -17,15 +20,31 @@
 #   maestrode hook <event>         Claude Code persistence hook (stdin JSON);
 #                                  event in: user-prompt, pre-tool, session-end
 #
+# mode profiles (model-agnostic; deployment sets the models via env):
+#   (default)         NORMAL muscle: text-block --files drafting (MAESTRODE_MODEL).
+#   --ultra           ULTRA muscle: agentic write_file tool loop + reasoning off
+#                     (MAESTRODE_ULTRA_MODEL). Implies --tools; needs --files.
+#                     For tool-native models (kimi, minimax) on gnarly tasks.
+#   --brain           planning call: a reasoning model emits a plan, not files
+#                     (MAESTRODE_BRAIN_MODEL). Reasons into the plan text; set
+#                     MAESTRODE_BRAIN_THINK=1 to use a separate thinking channel.
+#
 # flags:
 #   --session NAME    persist multi-turn at ~/.config/maestrode/sessions/NAME.json
 #   --system TEXT     system prompt
 #   --files DIR       parse <<<FILE: path >>> ... <<<END FILE>>> blocks, write each under DIR
+#   --tools           agentic write_file tool loop (instead of text blocks). The
+#                     muscle calls a real write_file tool; for tool-native models
+#                     that ramble past text-block formatting. Implied by --ultra.
 #   -f|--file PATH    attach file contents as user context (repeatable)
-#   --model ID        override MAESTRODE_MODEL
+#   --model ID        override the profile/MAESTRODE_MODEL
+#   --endpoint URL    override the profile/MAESTRODE_ENDPOINT
 #   --max-tokens N    override max_tokens
-#   --reasoning-effort LEVEL   low|medium|high|max (provider-dependent)
-#   --thinking-budget N        enables thinking with budget_tokens=N
+#   --reasoning-effort LEVEL   low|medium|high|max (OpenAI path; provider-dependent)
+#   --think                    enable thinking (Anthropic path). type=adaptive for
+#                              MiniMax/zen; pairs with --full to show the trace
+#   --thinking-type T          adaptive|disabled (MiniMax) or enabled (Anthropic)
+#   --thinking-budget N        Anthropic extended thinking: type=enabled, budget=N
 #   --full            also print reasoning_content
 #   --raw             skip auto fence/dash sanitization
 #   --dry-run         print payload size estimate, no API call
@@ -44,9 +63,16 @@
 #
 # env (from ~/.config/maestrode/env or shell):
 #   MAESTRODE_API_KEY        required
-#   MAESTRODE_MODEL          default: deepseek-v4-flash
+#   MAESTRODE_MODEL          normal muscle; default: deepseek-v4-flash
+#   MAESTRODE_ENDPOINT       normal muscle endpoint; default: api.deepseek.com/.../chat/completions
 #   MAESTRODE_MAX_TOKENS     default: 256000 (lower if your endpoint caps shorter)
-#   MAESTRODE_ENDPOINT       default: https://api.deepseek.com/v1/chat/completions
+#   MAESTRODE_ULTRA_MODEL    --ultra muscle (fallback: MAESTRODE_MODEL)
+#   MAESTRODE_ULTRA_ENDPOINT --ultra endpoint (fallback: MAESTRODE_ENDPOINT)
+#   MAESTRODE_ULTRA_REASONING --ultra reasoning_effort; default: none
+#   MAESTRODE_BRAIN_MODEL    --brain planner (fallback: MAESTRODE_MODEL)
+#   MAESTRODE_BRAIN_ENDPOINT --brain endpoint (fallback: MAESTRODE_ENDPOINT)
+#   MAESTRODE_BRAIN_THINK    set 1 to give the brain a separate thinking channel
+#   MAESTRODE_PROTOCOL       openai|anthropic; default auto from endpoint path
 #   MAESTRODE_CURL_TIMEOUT   default: 600 (seconds)
 #   MAESTRODE_ALLOW_SECRETS  set to 1 to bypass the secret-pattern scan
 #
@@ -60,11 +86,16 @@ set -euo pipefail
 CONFIG_DIR="${MAESTRODE_CONFIG_DIR:-${HOME}/.config/maestrode}"
 ENV_FILE="${CONFIG_DIR}/env"
 USAGE_LOG="${CONFIG_DIR}/usage.jsonl"
+# Load env file as DEFAULTS: a var already set in the caller's environment
+# (e.g. `MAESTRODE_ENDPOINT=... maestrode ...`) wins over the file. Sourcing
+# with `. "$ENV_FILE"` would instead clobber caller overrides, so apply each
+# KEY=VALUE only when KEY is unset.
 if [[ -f "$ENV_FILE" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  set +a
+  while IFS='=' read -r _k _v; do
+    [[ "$_k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ -z "${!_k:-}" ]] && export "$_k=$_v"
+  done < "$ENV_FILE"
+  unset _k _v
 fi
 
 # Subcommand: `maestrode gain` prints aggregate stats from the usage log.
@@ -223,11 +254,16 @@ BANNER = (
     "or let the muscle draft directly."
 )
 
+# Three modes (Claude Code only). normal: opus plans, muscle drafts. high:
+# brain model plans, muscle drafts, opus audits. ultra: brain plans, premium
+# tool muscle drafts, opus audits + spec-tests. Check ultra > high > normal.
+MODE_ULTRA = re.compile(r"\bmaestrode\s+ultra\b", re.I)
+MODE_HIGH = re.compile(r"\bmaestrode\s+high\b", re.I)
 ACTIVATE = re.compile(
-    r"(?:^|\b)(?:/maestrode\b|maestrode\s+(?:on|mode)\b|use\s+maestrode\b"
+    r"(?:^|\b)(?:/maestrode\b|maestrode\s+(?:on|mode|normal)\b|use\s+maestrode\b"
     r"|turn\s+on\s+maestrode\b|enable\s+maestrode\b)", re.I)
 DEACTIVATE = re.compile(
-    r"\b(?:maestrode\s+off|normal\s+mode|stop\s+maestrode|turn\s+off\s+maestrode"
+    r"\b(?:maestrode\s+off|stop\s+maestrode|turn\s+off\s+maestrode"
     r"|disable\s+maestrode)\b", re.I)
 
 def sfile(suffix=""):
@@ -235,6 +271,37 @@ def sfile(suffix=""):
 
 def is_active():
     return bool(safe) and sfile().exists()
+
+VALID_MODES = ("normal", "high", "ultra")
+
+def set_mode(mode):
+    # session file stores "<mode>\n<activation-ts>". Legacy files held just a ts.
+    sfile().write_text(mode + "\n" + str(time.time()))
+
+def get_mode():
+    try:
+        first = sfile().read_text().splitlines()[0].strip()
+    except (OSError, IndexError):
+        return "normal"
+    return first if first in VALID_MODES else "normal"
+
+def banner_for(mode):
+    if mode == "ultra":
+        return (
+            "[maestrode ULTRA] Brain offloaded + premium tool muscle. Per task: "
+            "(1) PLAN: maestrode --brain \"<spec + every edge case>\"  "
+            "(2) DRAFT: maestrode --ultra --files out/ \"<implement the plan>\"  "
+            "(3) AUDIT (you): write/run INDEPENDENT spec-tests (never the muscle's "
+            "own), fix-loop the muscle on real failures, then apply. Use ultra for "
+            "gnarly/algorithmic work where craft matters.")
+    if mode == "high":
+        return (
+            "[maestrode HIGH] Brain offloaded, reliable muscle. Per task: "
+            "(1) PLAN: maestrode --brain \"<spec + every edge case>\"  "
+            "(2) DRAFT: maestrode --files out/ \"<implement the plan>\"  "
+            "(3) AUDIT (you): run tests, fix-loop, apply. Routine bulk work; you "
+            "plan nothing and draft nothing, only review.")
+    return "[maestrode ON] " + BANNER
 
 def clear_session():
     for suffix in ("", ".lastcall", ".direct"):
@@ -304,18 +371,31 @@ if event == "user-prompt":
     if DEACTIVATE.search(prompt):
         clear_session()
         ups("[maestrode OFF] Mode deactivated. Resume direct authoring.")
-    if ACTIVATE.search(prompt):
-        sfile().write_text(str(time.time()))
-        ups("[maestrode ON] " + BANNER)
+    # mode select: ultra > high > normal. Switching resets the drift counter.
+    new_mode = None
+    if MODE_ULTRA.search(prompt):
+        new_mode = "ultra"
+    elif MODE_HIGH.search(prompt):
+        new_mode = "high"
+    elif ACTIVATE.search(prompt):
+        new_mode = "normal"
+    if new_mode:
+        set_mode(new_mode)
+        try:
+            sfile(".direct").unlink()
+        except OSError:
+            pass
+        ups(banner_for(new_mode))
     if is_active():
+        mode = get_mode()
         n = read_int(sfile(".direct"))
         if n >= 2:
-            ups("[maestrode ON, drift] You have bypassed the muscle %d times "
+            ups("[maestrode %s, drift] You have bypassed the muscle %d times "
                 "(direct edits or subagent spawns) since the last delegation. "
                 "Route the next draft through the muscle unless there is a named "
                 "reason (apply output, one-line tweak, architecture/security call "
-                "you must own)." % n)
-        ups("[maestrode ON] " + BANNER)
+                "you must own)." % (mode.upper(), n))
+        ups(banner_for(mode))
     silent()
 
 if event == "pre-tool":
@@ -368,9 +448,12 @@ PY
 fi
 
 : "${MAESTRODE_API_KEY:?set MAESTRODE_API_KEY in ${ENV_FILE} or env}"
+# Normal (default) muscle profile. --ultra / --brain swap these post-parse.
 MODEL="${MAESTRODE_MODEL:-deepseek-v4-flash}"
 ENDPOINT="${MAESTRODE_ENDPOINT:-https://api.deepseek.com/v1/chat/completions}"
 MAX_TOKENS="${MAESTRODE_MAX_TOKENS:-256000}"
+# Protocol + headers are resolved AFTER flag parsing, since --ultra/--brain can
+# change ENDPOINT (and the protocol/auth follow the endpoint path).
 
 FULL=0
 RAW=0
@@ -382,6 +465,13 @@ SESSION=""
 SYSTEM=""
 REASONING_EFFORT=""
 THINKING_BUDGET=""
+THINK="${MAESTRODE_THINK:-}"
+THINKING_TYPE="${MAESTRODE_THINKING_TYPE:-}"
+TOOLS="${MAESTRODE_TOOLS:-0}"
+ULTRA=0
+BRAIN=0
+MODEL_OVERRIDE=""
+ENDPOINT_OVERRIDE=""
 USER_FILES=()
 
 while [[ $# -gt 0 ]]; do
@@ -392,7 +482,13 @@ while [[ $# -gt 0 ]]; do
     --warmup)      WARMUP=1; shift ;;
     --reasoning-effort) REASONING_EFFORT="$2"; shift 2 ;;
     --thinking-budget)  THINKING_BUDGET="$2"; shift 2 ;;
-    --model)       MODEL="$2"; shift 2 ;;
+    --think)            THINK=1; shift ;;
+    --thinking-type)    THINKING_TYPE="$2"; shift 2 ;;
+    --tools)            TOOLS=1; shift ;;
+    --ultra)            ULTRA=1; shift ;;
+    --brain)            BRAIN=1; shift ;;
+    --model)       MODEL_OVERRIDE="$2"; shift 2 ;;
+    --endpoint)    ENDPOINT_OVERRIDE="$2"; shift 2 ;;
     --max-tokens)  MAX_TOKENS="$2"; shift 2 ;;
     --files)       FILES_DIR="$2"; shift 2 ;;
     --session)     SESSION="$2"; shift 2 ;;
@@ -407,6 +503,53 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Resolve the model profile from the mode flag. Profiles are env-driven so the
+# shim stays model-agnostic: a deployment sets the BRAIN/ULTRA models it wants.
+#   --ultra : ultra muscle (tool-calling, no muscle-side reasoning). The brain
+#             already planned, so the muscle implements; reasoning=none keeps
+#             tool-native models (kimi) from over-thinking past the tool call.
+#   --brain : planning call (a thinking model emits a plan, not files).
+#   (none)  : normal muscle (text-block --files drafting).
+# Explicit --model/--endpoint/--reasoning-effort flags still override a profile.
+if [[ "$ULTRA" == 1 ]]; then
+  MODEL="${MAESTRODE_ULTRA_MODEL:-$MODEL}"
+  ENDPOINT="${MAESTRODE_ULTRA_ENDPOINT:-$ENDPOINT}"
+  TOOLS=1
+  [[ -z "$REASONING_EFFORT" ]] && REASONING_EFFORT="${MAESTRODE_ULTRA_REASONING:-none}"
+elif [[ "$BRAIN" == 1 ]]; then
+  MODEL="${MAESTRODE_BRAIN_MODEL:-$MODEL}"
+  ENDPOINT="${MAESTRODE_BRAIN_ENDPOINT:-$ENDPOINT}"
+  # The brain reasons NATIVELY into the plan text. Do NOT divert reasoning into a
+  # separate thinking channel by default: adaptive thinking can burn the whole
+  # token budget before any plan content is written (finish=length, empty plan).
+  # Opt in with MAESTRODE_BRAIN_THINK=1 only if your brain model needs it.
+  if [[ "${MAESTRODE_BRAIN_THINK:-0}" == "1" \
+        && -z "$THINK" && -z "$THINKING_TYPE" && -z "$THINKING_BUDGET" ]]; then
+    THINK=1
+  fi
+fi
+[[ -n "$MODEL_OVERRIDE" ]] && MODEL="$MODEL_OVERRIDE"
+[[ -n "$ENDPOINT_OVERRIDE" ]] && ENDPOINT="$ENDPOINT_OVERRIDE"
+
+# Protocol select (post-profile): .../v1/messages speaks the Anthropic Messages
+# API, everything else OpenAI Chat Completions. Override with MAESTRODE_PROTOCOL.
+case "$ENDPOINT" in
+  */messages|*/messages/) PROTOCOL="anthropic" ;;
+  *)                      PROTOCOL="openai" ;;
+esac
+PROTOCOL="${MAESTRODE_PROTOCOL:-$PROTOCOL}"
+
+# Auth/headers follow the protocol. Anthropic uses x-api-key + anthropic-version
+# ONLY (no Authorization Bearer): Alibaba-proxied zen models like qwen3.7-max
+# 401 when Bearer is present; minimax works either way. OpenAI uses Bearer.
+CURL_HEADERS=(-H "Content-Type: application/json")
+if [[ "$PROTOCOL" == "anthropic" ]]; then
+  CURL_HEADERS+=(-H "x-api-key: ${MAESTRODE_API_KEY}" \
+                -H "anthropic-version: 2023-06-01")
+else
+  CURL_HEADERS+=(-H "Authorization: Bearer ${MAESTRODE_API_KEY}")
+fi
+
 TASK="${1:-}"
 
 # Default file-contract system prompt. When --files is set but the caller passed
@@ -415,7 +558,12 @@ TASK="${1:-}"
 # blocks), which the parser cannot read (exit 4, "no blocks parsed"). This hard
 # contract makes --files reliable regardless of brief phrasing: whole files,
 # delimited blocks, nothing else.
-if [[ -n "$FILES_DIR" && -z "$SYSTEM" ]]; then
+if [[ -n "$FILES_DIR" && -z "$SYSTEM" && "$TOOLS" == "1" ]]; then
+  # Tool mode: the muscle has a real write_file tool. Tell it to USE the tool,
+  # not to emit text blocks (the text-block contract below would contradict the
+  # tool and the model would sometimes answer in prose, writing nothing).
+  SYSTEM='You are a code-writing muscle with a write_file tool. Create every file by CALLING write_file (one call per file) with the relative path and the complete file contents. Do NOT put code in your text response; the only way a file gets written is the tool call. Use the exact relative paths from the brief. After all files are written, stop.'
+elif [[ -n "$FILES_DIR" && -z "$SYSTEM" ]]; then
   SYSTEM='You are a code-writing muscle. Your entire response is delimited file blocks and nothing else.
 For every file you create or change, emit exactly:
 <<<FILE: relative/path>>>
@@ -433,7 +581,9 @@ PAYLOAD_FILE=$(mktemp -t maestrode_payload.XXXXXX)
 RESP_FILE=$(mktemp -t maestrode_resp.XXXXXX)
 HDRS_FILE=$(mktemp -t maestrode_hdrs.XXXXXX)
 PARSER_FILE=$(mktemp -t maestrode_parser.XXXXXX)
-trap 'rm -f "$PROMPT_FILE" "$PAYLOAD_FILE" "$RESP_FILE" "$HDRS_FILE" "$PARSER_FILE"' EXIT
+STATE_FILE=$(mktemp -t maestrode_state.XXXXXX)
+CTRL_FILE=$(mktemp -t maestrode_ctrl.XXXXXX)
+trap 'rm -f "$PROMPT_FILE" "$PAYLOAD_FILE" "$RESP_FILE" "$HDRS_FILE" "$PARSER_FILE" "$STATE_FILE" "$CTRL_FILE"' EXIT
 
 {
   # Only read stdin when it is a real piped/redirected/heredoc input. A bare
@@ -495,6 +645,253 @@ PY
   fi
 fi
 
+# --tools: agentic write_file loop (maestrode ultra). Tool-native models like
+# MiniMax never converge on <<<FILE:>>> text blocks (they ramble in thinking),
+# but they DO converge when given a real tool: think, call write_file, stop.
+# Each turn we hand back a tool_result and re-call until the model stops asking
+# for tools. The full assistant turn (thinking+signature+tool_use) is appended
+# verbatim because MiniMax degrades if its thinking is dropped from history.
+if [[ "$TOOLS" == "1" ]]; then
+  # Tool-use works on both wire formats: Anthropic Messages (tool_use blocks)
+  # and OpenAI Chat Completions (tool_calls). Anthropic models (minimax, qwen)
+  # AND openai-compatible models (kimi) can all drive the write_file loop.
+  if [[ "$PROTOCOL" != "anthropic" && "$PROTOCOL" != "openai" ]]; then
+    echo "maestrode: --tools needs an Anthropic or OpenAI endpoint" >&2
+    exit 64
+  fi
+  if [[ -z "$FILES_DIR" ]]; then
+    echo "maestrode: --tools needs --files DIR (where written files land)" >&2
+    exit 64
+  fi
+  CALL_T0=$(python3 -c 'import time; print(time.time())')
+  # seed conversation with the user brief
+  python3 - "$PROMPT_FILE" "$STATE_FILE" <<'PY'
+import json, sys
+msg = open(sys.argv[1]).read()
+json.dump({"messages": [{"role": "user", "content": msg}],
+           "usage": {"in": 0, "out": 0, "cache": 0},
+           "trace": [], "files": []}, open(sys.argv[2], "w"))
+PY
+  MAX_ITERS="${MAESTRODE_TOOL_ITERS:-16}"
+  iter=0
+  while [[ $iter -lt $MAX_ITERS ]]; do
+    MODEL="$MODEL" MAX_TOKENS="$MAX_TOKENS" SYSTEM="$SYSTEM" PROTOCOL="$PROTOCOL" \
+    THINK="$THINK" THINKING_TYPE="$THINKING_TYPE" THINKING_BUDGET="$THINKING_BUDGET" \
+    REASONING_EFFORT="$REASONING_EFFORT" \
+    python3 - "$STATE_FILE" "$PAYLOAD_FILE" <<'PY'
+import json, os, sys
+st = json.load(open(sys.argv[1]))
+proto = os.environ.get("PROTOCOL") or "anthropic"
+sysmsg = os.environ.get("SYSTEM") or ""
+model = os.environ["MODEL"]
+max_tokens = int(os.environ["MAX_TOKENS"])
+think = (os.environ.get("THINK") or "") not in ("", "0")
+think_type = os.environ.get("THINKING_TYPE") or ""
+tb = os.environ.get("THINKING_BUDGET") or ""
+re_effort = os.environ.get("REASONING_EFFORT") or ""
+
+WF_DESC = ("Create or overwrite a file with its complete contents. "
+           "Call once per file. Use the exact relative paths from the brief.")
+WF_PROPS = {"path": {"type": "string", "description": "relative file path"},
+            "content": {"type": "string", "description": "the complete file contents"}}
+
+if proto == "openai":
+    # OpenAI Chat Completions tool-calling (kimi and other openai-compatible).
+    messages = list(st["messages"])
+    if sysmsg and not (messages and messages[0].get("role") == "system"):
+        messages = [{"role": "system", "content": sysmsg}] + messages
+    body = {
+        "model": model, "max_tokens": max_tokens, "messages": messages, "stream": False,
+        "tools": [{"type": "function", "function": {
+            "name": "write_file", "description": WF_DESC,
+            "parameters": {"type": "object", "properties": WF_PROPS,
+                           "required": ["path", "content"]}}}],
+    }
+    if re_effort:
+        body["reasoning_effort"] = re_effort
+else:
+    # Anthropic Messages tool-use (minimax, qwen).
+    body = {
+        "model": model, "max_tokens": max_tokens, "messages": st["messages"],
+        "stream": False,
+        "tools": [{"name": "write_file", "description": WF_DESC,
+                   "input_schema": {"type": "object", "properties": WF_PROPS,
+                                    "required": ["path", "content"]}}],
+    }
+    if sysmsg:
+        body["system"] = sysmsg
+    if think or think_type or tb:
+        t = think_type or ("enabled" if tb else "adaptive")
+        th = {"type": t}
+        if t == "enabled":
+            th["budget_tokens"] = int(tb or 4000)
+        body["thinking"] = th
+json.dump(body, open(sys.argv[2], "w"))
+PY
+    # Per-iteration call with transient retry (curl idle/timeout 28, or zen 5xx /
+    # 429 which do occur mid-loop). Non-transient failures abort the whole loop.
+    tries=0; tmax="${MAESTRODE_MAX_RETRIES:-3}"; bo=2
+    while true; do
+      : > "$RESP_FILE"; : > "$HDRS_FILE"
+      set +e
+      curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-600}" -D "$HDRS_FILE" \
+        -X POST "$ENDPOINT" "${CURL_HEADERS[@]}" --data-binary "@$PAYLOAD_FILE" > "$RESP_FILE"
+      cx=$?
+      set -e
+      hc=$(awk 'NR==1 {print $2; exit}' "$HDRS_FILE" 2>/dev/null || echo "")
+      [[ $cx -eq 0 && "$hc" == "200" ]] && break
+      transient=0
+      [[ $cx -eq 28 ]] && transient=1
+      case "$hc" in 429|500|502|503) transient=1 ;; esac
+      if [[ $transient -eq 1 && $tries -lt $tmax ]]; then
+        echo "maestrode: tool call retry $((tries+1))/$tmax (curl=$cx http=$hc) after ${bo}s" >&2
+        sleep "$bo"; tries=$((tries+1)); bo=$((bo*2)); continue
+      fi
+      echo "maestrode: tool call failed (curl=$cx http=$hc)" >&2
+      [[ -s "$RESP_FILE" ]] && { cat "$RESP_FILE" >&2; echo >&2; }
+      [[ "$hc" == "200" || -z "$hc" ]] && exit 1 || exit 2
+    done
+    # This step writes files, mutates STATE_FILE, and logs progress to stderr.
+    # It signals loop control by writing CONTINUE/STOP to CTRL_FILE rather than
+    # via $()-capture, so the control word never entangles with its file/stderr
+    # work. (Heredoc-in-$() does parse fine on bash 3.2.57, so this is for
+    # separation of concerns, not a parser workaround.)
+    FILES_DIR="$FILES_DIR" CTRL_FILE="$CTRL_FILE" PROTOCOL="$PROTOCOL" \
+    python3 - "$RESP_FILE" "$STATE_FILE" <<'PY'
+import json, os, sys, pathlib
+resp = json.load(open(sys.argv[1]))
+st = json.load(open(sys.argv[2]))
+proto = os.environ.get("PROTOCOL") or "anthropic"
+ctrl_file = os.environ["CTRL_FILE"]
+base = pathlib.Path(os.environ["FILES_DIR"]); base.mkdir(parents=True, exist_ok=True)
+def emit(word):
+    open(ctrl_file, "w").write(word)
+if "error" in resp:
+    sys.stderr.write("maestrode api err: " + json.dumps(resp["error"]) + "\n")
+    emit("STOP"); sys.exit(0)
+
+# single safe-write used by both protocol branches; returns the rel path on
+# success or None if refused (path traversal / absolute).
+def safe_write(path, content):
+    rel = (path or "").strip().lstrip("/")
+    parts = pathlib.PurePosixPath(rel).parts
+    if not rel or ".." in parts or any(p.startswith("/") for p in parts):
+        sys.stderr.write(f"maestrode: refused unsafe path {rel!r}\n")
+        return None
+    content = "" if content is None else content
+    if not content.endswith("\n"):
+        content += "\n"
+    tgt = base / rel
+    tgt.parent.mkdir(parents=True, exist_ok=True)
+    tgt.write_text(content)
+    st["files"].append(str(tgt))
+    sys.stderr.write(f"  + {tgt}\n")
+    return rel
+
+if proto == "openai":
+    choice = (resp.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    finish = choice.get("finish_reason")
+    u = resp.get("usage") or {}
+    st["usage"]["in"] += u.get("prompt_tokens") or 0
+    st["usage"]["out"] += u.get("completion_tokens") or 0
+    st["usage"]["cache"] += ((u.get("prompt_tokens_details") or {}).get("cached_tokens")
+                             or u.get("prompt_cache_hit_tokens") or 0)
+    if msg.get("reasoning_content"):
+        st["trace"].append(msg["reasoning_content"])
+    if msg.get("content"):
+        st["trace"].append("[text] " + msg["content"])
+    st["messages"].append(msg)  # assistant turn (content + tool_calls) verbatim
+    tool_calls = msg.get("tool_calls") or []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        tid = tc.get("id")
+        name = fn.get("name")
+        try:
+            inp = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            inp = {}
+        if name == "write_file":
+            w = safe_write(inp.get("path"), inp.get("content"))
+            res = f"wrote {w}" if w else "refused: unsafe path"
+        else:
+            res = f"unknown tool {name}"
+        st["messages"].append({"role": "tool", "tool_call_id": tid, "content": res})
+    cont = bool(tool_calls) and finish == "tool_calls"
+else:
+    blocks = resp.get("content") or []
+    stop = resp.get("stop_reason")
+    u = resp.get("usage") or {}
+    st["usage"]["in"] += u.get("input_tokens") or 0
+    st["usage"]["out"] += u.get("output_tokens") or 0
+    st["usage"]["cache"] += u.get("cache_read_input_tokens") or 0
+    for b in blocks:
+        if b.get("type") == "thinking" and b.get("thinking"):
+            st["trace"].append(b["thinking"])
+        elif b.get("type") == "text" and b.get("text"):
+            st["trace"].append("[text] " + b["text"])
+    # append the assistant turn verbatim (keep thinking+signature+tool_use intact)
+    st["messages"].append({"role": "assistant", "content": blocks})
+    tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
+    results = []
+    for tu in tool_uses:
+        name = tu.get("name"); inp = tu.get("input") or {}; tid = tu.get("id")
+        if name == "write_file":
+            w = safe_write(inp.get("path"), inp.get("content"))
+            if w:
+                results.append({"type": "tool_result", "tool_use_id": tid, "content": f"wrote {w}"})
+            else:
+                results.append({"type": "tool_result", "tool_use_id": tid,
+                                "content": "refused: unsafe path", "is_error": True})
+        else:
+            results.append({"type": "tool_result", "tool_use_id": tid,
+                            "content": f"unknown tool {name}", "is_error": True})
+    if results:
+        st["messages"].append({"role": "user", "content": results})
+    cont = bool(tool_uses) and stop == "tool_use"
+
+json.dump(st, open(sys.argv[2], "w"))
+emit("CONTINUE" if cont else "STOP")
+PY
+    iter=$((iter+1))
+    [[ "$(cat "$CTRL_FILE")" == "STOP" ]] && break
+  done
+  if [[ $iter -ge $MAX_ITERS ]]; then
+    echo "maestrode: hit tool-loop cap ($MAX_ITERS iters); model still calling tools. raise MAESTRODE_TOOL_ITERS." >&2
+  fi
+  FULL="$FULL" CALL_T0="$CALL_T0" USAGE_LOG="$USAGE_LOG" MODEL="$MODEL" ITERS="$iter" \
+  python3 - "$STATE_FILE" <<'PY'
+import json, os, sys, time, datetime, pathlib
+st = json.load(open(sys.argv[1]))
+files = st["files"]; u = st["usage"]
+if os.environ.get("FULL") == "1" and st["trace"]:
+    sys.stdout.write("----- reasoning -----\n")
+    sys.stdout.write("\n\n".join(st["trace"]).rstrip() + "\n")
+    sys.stdout.write("----- end reasoning -----\n\n")
+for f in files:
+    sys.stdout.write(f"wrote {f}\n")
+prompt = u["in"] + u["cache"]
+t0 = float(os.environ.get("CALL_T0") or 0) or time.time()
+wall = round(max(0.0, time.time() - t0), 2)
+sys.stderr.write(f"[maestrode ultra model={os.environ.get('MODEL')} "
+                 f"iters={os.environ.get('ITERS')} prompt~{prompt} out={u['out']} "
+                 f"files={len(files)} cache={u['cache']} wall={wall}s]\n")
+if not files:
+    sys.stderr.write("maestrode: no files written (model made no write_file calls)\n")
+log = os.environ.get("USAGE_LOG") or ""
+if log:
+    rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+           "model": os.environ.get("MODEL") or "", "prompt": prompt, "out": u["out"],
+           "reason": 0, "cache_hit": u["cache"], "cache_miss": u["in"],
+           "finish": "stop", "wall": wall, "files": len(files), "exit": 0 if files else 4}
+    p = pathlib.Path(log); p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+sys.exit(0 if files else 4)
+PY
+  exit $?
+fi
+
 SESSION_DIR="${CONFIG_DIR}/sessions"
 SESSION_FILE=""
 if [[ -n "$SESSION" ]]; then
@@ -503,8 +900,9 @@ if [[ -n "$SESSION" ]]; then
 fi
 
 MODEL="$MODEL" MAX_TOKENS="$MAX_TOKENS" SYSTEM="$SYSTEM" \
-SESSION_FILE="$SESSION_FILE" \
+SESSION_FILE="$SESSION_FILE" PROTOCOL="$PROTOCOL" \
 REASONING_EFFORT="$REASONING_EFFORT" THINKING_BUDGET="$THINKING_BUDGET" \
+THINK="$THINK" THINKING_TYPE="$THINKING_TYPE" \
 python3 - "$PROMPT_FILE" "$PAYLOAD_FILE" <<'PY'
 import json, os, sys
 user_msg = open(sys.argv[1]).read()
@@ -513,25 +911,60 @@ session_file = os.environ.get("SESSION_FILE") or ""
 if session_file and os.path.exists(session_file):
     messages = json.load(open(session_file))
 sysmsg = os.environ.get("SYSTEM") or ""
-if sysmsg:
-    if messages and messages[0].get("role") == "system":
-        messages[0]["content"] = sysmsg
-    else:
-        messages.insert(0, {"role": "system", "content": sysmsg})
-messages.append({"role": "user", "content": user_msg})
-payload = {
-    "model": os.environ["MODEL"],
-    "max_tokens": int(os.environ["MAX_TOKENS"]),
-    "messages": messages,
-    "stream": True,
-    "stream_options": {"include_usage": True},
-}
+proto = os.environ.get("PROTOCOL") or "openai"
+model = os.environ["MODEL"]
+max_tokens = int(os.environ["MAX_TOKENS"])
 re_effort = os.environ.get("REASONING_EFFORT") or ""
-if re_effort:
-    payload["reasoning_effort"] = re_effort
 tb = os.environ.get("THINKING_BUDGET") or ""
-if tb:
-    payload["thinking"] = {"type": "enabled", "budget_tokens": int(tb)}
+think = (os.environ.get("THINK") or "") not in ("", "0")
+think_type = os.environ.get("THINKING_TYPE") or ""
+
+# A prior system message may sit at messages[0] (from an earlier turn). Pull it
+# out: both protocols carry the system prompt separately, never inline in the
+# message list. An explicit --system wins over a stored one.
+if messages and messages[0].get("role") == "system":
+    if not sysmsg:
+        sysmsg = messages[0].get("content") or ""
+    messages = messages[1:]
+messages.append({"role": "user", "content": user_msg})
+
+if proto == "anthropic":
+    # Anthropic Messages API: system is top-level, messages are user/assistant
+    # only, max_tokens required, usage streams in message_start/message_delta.
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": messages,
+        "stream": True,
+    }
+    if sysmsg:
+        payload["system"] = sysmsg
+    # Thinking on the Anthropic path. Two vocabularies share this endpoint:
+    #   - real Anthropic / Claude: thinking.type "enabled" + budget_tokens
+    #   - MiniMax (zen go): thinking.type "adaptive" | "disabled", NO budget
+    # Default type is "adaptive" (the zen-minimax target) unless a budget is
+    # given (implies the Anthropic "enabled" form) or --thinking-type overrides.
+    # reasoning_effort is not an Anthropic field, so it is ignored here.
+    if think or think_type or tb:
+        ttype = think_type or ("enabled" if tb else "adaptive")
+        thinking = {"type": ttype}
+        if ttype == "enabled":
+            thinking["budget_tokens"] = int(tb or 4000)
+        payload["thinking"] = thinking
+else:
+    if sysmsg:
+        messages.insert(0, {"role": "system", "content": sysmsg})
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if re_effort:
+        payload["reasoning_effort"] = re_effort
+    if tb:
+        payload["thinking"] = {"type": "enabled", "budget_tokens": int(tb)}
 open(sys.argv[2], "w").write(json.dumps(payload))
 PY
 
@@ -554,8 +987,7 @@ json.dump(p, open(sys.argv[2], "w"))
 PY
   curl -sS --max-time "${MAESTRODE_CURL_TIMEOUT:-600}" \
     -o "$WARMUP_RESP" -X POST "$ENDPOINT" \
-    -H "Authorization: Bearer ${MAESTRODE_API_KEY}" \
-    -H "Content-Type: application/json" \
+    "${CURL_HEADERS[@]}" \
     --data-binary "@$WARMUP_PAYLOAD" >/dev/null 2>&1 || true
   sys_cached=$(python3 -c "
 import json, sys
@@ -596,8 +1028,9 @@ CALL_T0=$(python3 -c 'import time; print(time.time())')
 # parser (FULL/RAW/FILES_DIR block) works unchanged. If the response body
 # is not SSE (HTTP error JSON), the raw body is passed through.
 cat > "$PARSER_FILE" <<'PY'
-import json, sys, time
+import json, os, sys, time
 
+proto = os.environ.get("PROTOCOL") or "openai"
 content = []
 reasoning = []
 usage = None
@@ -610,18 +1043,21 @@ saw_sse = False
 raw_buf = []
 done = False
 
-# Iterate to natural EOF (do NOT break on [DONE]). Breaking early closes
-# the read end of the curl|python pipe, curl then writes the final bytes
+# Iterate to natural EOF (do NOT break on [DONE]/message_stop). Breaking early
+# closes the read end of the curl|python pipe, curl then writes the final bytes
 # into a broken pipe and exits 56, which the parent loop misreads as a
 # transport failure even though we already have the full response.
 for raw in sys.stdin:
     line = raw.rstrip('\n').rstrip('\r')
-    if not line.startswith('data: '):
+    # Both protocols are SSE: payload rides on `data:` lines. Anthropic also
+    # emits `event:` lines (event type is duplicated inside the data JSON's
+    # "type" field, so we dispatch off that and can ignore the event: lines).
+    if not line.startswith('data:'):
         if not saw_sse:
             raw_buf.append(raw)
         continue
     saw_sse = True
-    payload = line[6:]
+    payload = line[5:].lstrip()
     if payload == '[DONE]':
         done = True
         continue
@@ -631,28 +1067,65 @@ for raw in sys.stdin:
         chunk = json.loads(payload)
     except json.JSONDecodeError:
         continue
-    if chunk.get('error'):
-        json.dump(chunk, sys.stdout)
-        sys.exit(0)
-    if chunk.get('usage'):
-        usage = chunk['usage']
-    if not model and chunk.get('model'):
-        model = chunk['model']
-    choices = chunk.get('choices') or []
-    if not choices:
-        continue
-    delta = choices[0].get('delta') or {}
-    c = delta.get('content')
-    if c:
-        content.append(c)
-        content_chars += len(c)
-    r = delta.get('reasoning_content')
-    if r:
-        reasoning.append(r)
-        reasoning_chars += len(r)
-    fr = choices[0].get('finish_reason')
-    if fr:
-        finish = fr
+
+    if proto == "anthropic":
+        ctype = chunk.get("type")
+        if ctype == "error" or chunk.get("error"):
+            json.dump(chunk, sys.stdout)
+            sys.exit(0)
+        if ctype == "message_start":
+            msg = chunk.get("message") or {}
+            if not model:
+                model = msg.get("model")
+            usage = dict(msg.get("usage") or {})
+        elif ctype == "content_block_delta":
+            d = chunk.get("delta") or {}
+            dt = d.get("type")
+            if dt == "text_delta":
+                t = d.get("text") or ""
+                if t:
+                    content.append(t)
+                    content_chars += len(t)
+            elif dt == "thinking_delta":
+                t = d.get("thinking") or ""
+                if t:
+                    reasoning.append(t)
+                    reasoning_chars += len(t)
+        elif ctype == "message_delta":
+            d = chunk.get("delta") or {}
+            sr = d.get("stop_reason")
+            if sr:
+                finish = sr
+            u = chunk.get("usage") or {}
+            if u:
+                usage = usage or {}
+                usage.update(u)
+        elif ctype == "message_stop":
+            done = True
+    else:
+        if chunk.get('error'):
+            json.dump(chunk, sys.stdout)
+            sys.exit(0)
+        if chunk.get('usage'):
+            usage = chunk['usage']
+        if not model and chunk.get('model'):
+            model = chunk['model']
+        choices = chunk.get('choices') or []
+        if not choices:
+            continue
+        delta = choices[0].get('delta') or {}
+        c = delta.get('content')
+        if c:
+            content.append(c)
+            content_chars += len(c)
+        r = delta.get('reasoning_content')
+        if r:
+            reasoning.append(r)
+            reasoning_chars += len(r)
+        fr = choices[0].get('finish_reason')
+        if fr:
+            finish = fr
+
     now = time.time()
     if now - last_hb >= 1.0:
         if reasoning_chars and not content_chars:
@@ -666,6 +1139,28 @@ if not saw_sse:
     sys.stdout.write(''.join(raw_buf))
     sys.exit(0)
 
+# Normalize to one internal (OpenAI-shaped) response so everything downstream
+# (escalation scan, --files, session write, stat line, usage log) is unchanged.
+if proto == "anthropic":
+    u = usage or {}
+    inp = u.get("input_tokens") or 0
+    cache_read = u.get("cache_read_input_tokens") or 0
+    cache_write = u.get("cache_creation_input_tokens") or 0
+    out_tok = u.get("output_tokens") or 0
+    sr_map = {"end_turn": "stop", "max_tokens": "length",
+              "stop_sequence": "stop", "tool_use": "tool_calls"}
+    finish_norm = sr_map.get(finish, finish or "stop")
+    out_usage = {
+        "prompt_tokens": inp + cache_read + cache_write,
+        "completion_tokens": out_tok,
+        "completion_tokens_details": {"reasoning_tokens": 0},
+        "prompt_cache_hit_tokens": cache_read,
+        "prompt_cache_miss_tokens": inp,
+    }
+else:
+    finish_norm = finish or "stop"
+    out_usage = usage or {}
+
 out = {
     "model": model or "",
     "choices": [{
@@ -673,9 +1168,9 @@ out = {
             "content": "".join(content),
             "reasoning_content": "".join(reasoning) or None,
         },
-        "finish_reason": finish or "stop",
+        "finish_reason": finish_norm,
     }],
-    "usage": usage or {},
+    "usage": out_usage,
 }
 json.dump(out, sys.stdout)
 PY
@@ -693,10 +1188,9 @@ while true; do
     --max-time "${MAESTRODE_CURL_TIMEOUT:-600}" \
     -D "$HDRS_FILE" \
     -X POST "$ENDPOINT" \
-    -H "Authorization: Bearer ${MAESTRODE_API_KEY}" \
-    -H "Content-Type: application/json" \
+    "${CURL_HEADERS[@]}" \
     --data-binary "@$PAYLOAD_FILE" \
-    | python3 -u "$PARSER_FILE" > "$RESP_FILE"
+    | PROTOCOL="$PROTOCOL" python3 -u "$PARSER_FILE" > "$RESP_FILE"
   CURL_EXIT="${PIPESTATUS[0]}"
   set -e
   HTTP_CODE=$(awk 'NR==1 {print $2; exit}' "$HDRS_FILE" 2>/dev/null || echo "")
@@ -763,6 +1257,23 @@ except (KeyError, IndexError):
 content = m.get("content") or ""
 reasoning = m.get("reasoning_content") or ""
 finish = choice.get("finish_reason") or ""
+
+# Some models (minimax-m3, qwen) emit chain-of-thought inline as <think>...</think>
+# in the content channel instead of a separate reasoning_content field. Pull those
+# blocks out of content so drafted code/prose and --files output never carry them.
+# Fold the text into reasoning so --full still surfaces it. Run this BEFORE the
+# escalation scan, session write, and --files parse so a <<<NEEDS_SMART>>> marker
+# placed after a think block is still seen as the first real line.
+_think = re.findall(r'<think(?:ing)?>(.*?)</think(?:ing)?>', content, flags=re.DOTALL | re.IGNORECASE)
+content = re.sub(r'<think(?:ing)?>.*?</think(?:ing)?>', '', content, flags=re.DOTALL | re.IGNORECASE)
+# A dangling, unclosed <think> means reasoning was truncated (finish=length) with
+# no usable content after it. Drop from the open tag through end-of-string.
+content = re.sub(r'<think(?:ing)?>(?:(?!</think(?:ing)?>).)*$', '', content, flags=re.DOTALL | re.IGNORECASE)
+if _think:
+    _extracted = "\n".join(t.strip() for t in _think if t.strip())
+    if _extracted:
+        reasoning = (reasoning.rstrip() + "\n\n" + _extracted).strip() if reasoning else _extracted
+content = content.strip()
 
 # Self-report escalation: if the muscle decides the task exceeds its capability
 # or the brief is too ambiguous, it emits <<<NEEDS_SMART>>> (optionally with a
