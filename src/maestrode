@@ -376,6 +376,7 @@ FULL=0
 RAW=0
 DRY_RUN=0
 WARMUP=0
+DIFF="${MAESTRODE_DIFF:-0}"
 FILES_DIR=""
 SESSION=""
 SYSTEM=""
@@ -407,6 +408,25 @@ while [[ $# -gt 0 ]]; do
 done
 
 TASK="${1:-}"
+
+# Default file-contract system prompt. When --files is set but the caller passed
+# no --system, the muscle gets no system-level instruction to emit <<<FILE:>>>
+# blocks; for edit-style briefs it then answers in markdown + code fences (no
+# blocks), which the parser cannot read (exit 4, "no blocks parsed"). This hard
+# contract makes --files reliable regardless of brief phrasing: whole files,
+# delimited blocks, nothing else.
+if [[ -n "$FILES_DIR" && -z "$SYSTEM" ]]; then
+  SYSTEM='You are a code-writing muscle. Your entire response is delimited file blocks and nothing else.
+For every file you create or change, emit exactly:
+<<<FILE: relative/path>>>
+(the complete file contents)
+<<<END FILE>>>
+Rules:
+- Output ONLY these blocks. No prose, no explanation, no apology, no markdown code fences, no diffs, no partial snippets.
+- Always emit the COMPLETE file contents in each block. When modifying an existing file, re-emit the entire file with your changes applied, never just the changed lines.
+- Use the exact relative paths given in the brief.
+If the brief is ambiguous, missing key details, or beyond your capability, emit <<<NEEDS_SMART: one-line reason>>> as the very first line and stop.'
+fi
 
 PROMPT_FILE=$(mktemp -t maestrode_prompt.XXXXXX)
 PAYLOAD_FILE=$(mktemp -t maestrode_payload.XXXXXX)
