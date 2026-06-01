@@ -44,16 +44,33 @@ you draft by hand.
     # 1. plan (brain model returns a written plan + edge cases, not files)
     maestrode --brain "Plan <task>. Enumerate the algorithm and EVERY edge case." > /tmp/plan.md
 
-    # 2. draft (muscle implements the plan)
+    # 2. draft (muscle implements the plan, writes to scratch dir out/)
     maestrode --files out/ "Implement this plan. <brief>. PLAN: $(cat /tmp/plan.md)"        # high
     maestrode --ultra --files out/ "Implement this plan. <brief>. PLAN: $(cat /tmp/plan.md)" # ultra
 
-    # 3. audit (you): see "Ultra/high audit" below
+    # 3. audit (you): independent spec-tests, see "Ultra/high audit" below
+    # 4. apply: Write/Edit each out/<file> to its real path (renders natively)
 
 `--ultra` auto-enables the tool-calling muscle with reasoning off (the brain
 already reasoned). `--brain` runs the planner so it reasons straight into the
 plan text (no separate thinking channel, which would burn the budget before the
 plan is written). Both are env-driven, so this stays model-agnostic.
+
+## Apply drafts natively (render like your own edits)
+
+The muscle always writes to a scratch `out/`, never the real tree. To LAND a
+draft, apply it with the native Write / Edit tools, not `cp` / `mv` / shell:
+
+- new file: `Write` the real path with the content the muscle put in `out/`.
+- existing file: `Edit` (or `Write` the whole file) to apply the muscle's version.
+
+This makes the change render as a native Claude Code edit (the diff shows in the
+UI exactly like when you author by hand), instead of an opaque shell copy. The
+muscle generated the content off the Claude meter; you only re-emit it through
+the native tool so the user sees a normal edit. This Write/Edit-to-apply is the
+one direct edit always allowed in every mode (it is "applying muscle output").
+Shell-copying works but renders as Bash, so prefer Write/Edit. Apply only after
+the audit passes (high/ultra).
 
 ## Ultra/high audit: independent tests, never the muscle's own
 
