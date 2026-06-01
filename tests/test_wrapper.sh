@@ -514,6 +514,67 @@ rm -f "$REQ_CAP"
 env $PROF PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --ultra --model my-override --files "$TMP/m2" "x" >/dev/null 2>&1 || true
 [[ "$(field "p['model']")" == "my-override" ]] && ok "--model overrides ultra profile" || ko "override failed: $(field "p['model']")"
 
+echo "== test 36: --ultra uses a context-safe default max_tokens (not 256000) =="
+rm -f "$REQ_CAP"
+env $PROF PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --ultra --files "$TMP/m36" "x" >/dev/null 2>&1 || true
+[[ "$(field "p['max_tokens']")" == "32000" ]] && ok "ultra default max_tokens=32000" || ko "ultra max_tokens wrong: $(field "p['max_tokens']")"
+
+echo "== test 37: MAESTRODE_ULTRA_MAX_TOKENS overrides the ultra default =="
+rm -f "$REQ_CAP"
+env $PROF MAESTRODE_ULTRA_MAX_TOKENS=48000 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --ultra --files "$TMP/m37" "x" >/dev/null 2>&1 || true
+[[ "$(field "p['max_tokens']")" == "48000" ]] && ok "ULTRA_MAX_TOKENS honored" || ko "ULTRA_MAX_TOKENS ignored: $(field "p['max_tokens']")"
+
+echo "== test 38: explicit --max-tokens wins over the ultra default =="
+rm -f "$REQ_CAP"
+env $PROF PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --ultra --max-tokens 5000 --files "$TMP/m38" "x" >/dev/null 2>&1 || true
+[[ "$(field "p['max_tokens']")" == "5000" ]] && ok "explicit --max-tokens wins" || ko "explicit max_tokens lost: $(field "p['max_tokens']")"
+
+echo "== test 39: context clamp reduces max_tokens below the reservation =="
+rm -f "$REQ_CAP"
+err=$(env $PROF MAESTRODE_ULTRA_CONTEXT_LIMIT=20000 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --ultra --files "$TMP/m39" "x" 2>&1 >/dev/null) || true
+mt=$(field "p['max_tokens']")
+[[ -n "$mt" && "$mt" -lt 32000 ]] && ok "max_tokens clamped to $mt (< 32000)" || ko "clamp did not fire: max_tokens=$mt"
+[[ "$err" == *"clamped max_tokens"* ]] && ok "clamp diagnostic surfaced" || ko "no clamp message: $err"
+
+echo "== test 40: input larger than context exits non-zero, no call =="
+rm -f "$REQ_CAP"
+set +e
+err=$(env $PROF MAESTRODE_ULTRA_CONTEXT_LIMIT=10 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --ultra --files "$TMP/m40" "x" 2>&1 >/dev/null)
+code=$?
+set -e
+[[ $code -ne 0 ]] && ok "oversized input exits non-zero ($code)" || ko "oversized input exited 0"
+[[ "$err" == *"exceeds"*"context"* ]] && ok "oversized-input diagnostic surfaced" || ko "no oversize message: $err"
+
+# ---- empty output (out=0) fail-loud on the plain-text path ----
+# Stub returns a stream whose content delta is controlled by EMPTY_CONTENT.
+cat > "$SHIM_BIN/curl" <<EOF
+#!/usr/bin/env bash
+body=""
+while [[ \$# -gt 0 ]]; do case "\$1" in --data-binary) body="\${2#@}" ;; -D) printf 'HTTP/1.1 200 OK\r\n\r\n' > "\$2"; shift ;; esac; shift; done
+if [[ "\${EMPTY_CONTENT:-1}" == "1" ]]; then
+  printf 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":0,"prompt_tokens":5}}\ndata: [DONE]\n\n'
+else
+  printf 'data: {"choices":[{"delta":{"content":"a real plan"},"finish_reason":"stop"}],"usage":{"completion_tokens":3,"prompt_tokens":5}}\ndata: [DONE]\n\n'
+fi
+EOF
+chmod +x "$SHIM_BIN/curl"
+
+# plain-text call on the normal (openai) profile so the openai-shaped SSE stub parses.
+echo "== test 41: empty plain-text output exits 6 =="
+set +e
+err=$(env $PROF EMPTY_CONTENT=1 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "plan a big thing" 2>&1 >/dev/null)
+code=$?
+set -e
+[[ $code -eq 6 ]] && ok "empty output exits 6" || ko "empty output exit wrong: $code"
+[[ "$err" == *"empty output (out=0)"* ]] && ok "empty-output diagnostic surfaced" || ko "no empty-output message: $err"
+
+echo "== test 42: non-empty plain-text output still exits 0 =="
+set +e
+out=$(env $PROF EMPTY_CONTENT=0 PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "plan a big thing" 2>/dev/null)
+code=$?
+set -e
+[[ $code -eq 0 && "$out" == "a real plan" ]] && ok "non-empty output exits 0 with content" || ko "non-empty path broke: code=$code out='$out'"
+
 echo
 echo "==== $PASS passed, $FAIL failed ===="
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

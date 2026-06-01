@@ -69,9 +69,17 @@
 #   MAESTRODE_ULTRA_MODEL    --ultra muscle (fallback: MAESTRODE_MODEL)
 #   MAESTRODE_ULTRA_ENDPOINT --ultra endpoint (fallback: MAESTRODE_ENDPOINT)
 #   MAESTRODE_ULTRA_REASONING --ultra reasoning_effort; default: none
+#   MAESTRODE_ULTRA_MAX_TOKENS --ultra output reservation; default: 32000. (The
+#                            256000 normal default reserves nearly a whole 262144
+#                            context, so input + output 400s the provider.)
 #   MAESTRODE_BRAIN_MODEL    --brain planner (fallback: MAESTRODE_MODEL)
 #   MAESTRODE_BRAIN_ENDPOINT --brain endpoint (fallback: MAESTRODE_ENDPOINT)
 #   MAESTRODE_BRAIN_THINK    set 1 to give the brain a separate thinking channel
+#   MAESTRODE_CONTEXT_LIMIT  model context window. When set, max_tokens is clamped
+#                            to (limit - est_input - margin) so the output
+#                            reservation never overshoots the window. Per-mode:
+#                            MAESTRODE_ULTRA_CONTEXT_LIMIT / MAESTRODE_BRAIN_CONTEXT_LIMIT.
+#   MAESTRODE_CONTEXT_MARGIN headroom left for the clamp; default: 1024 tokens
 #   MAESTRODE_PROTOCOL       openai|anthropic; default auto from endpoint path
 #   MAESTRODE_CURL_TIMEOUT   default: 600 (seconds)
 #   MAESTRODE_ALLOW_SECRETS  set to 1 to bypass the secret-pattern scan
@@ -79,6 +87,7 @@
 # exit codes:
 #   0 ok, 1 transport error, 2 api error, 3 rate limit (429),
 #   4 --files parse: no blocks found, 5 muscle escalated (NEEDS_SMART),
+#   6 empty output (out=0): model produced no content,
 #   64 usage, 65 secrets detected, 66 file not found
 
 set -euo pipefail
@@ -473,6 +482,9 @@ BRAIN=0
 MODEL_OVERRIDE=""
 ENDPOINT_OVERRIDE=""
 USER_FILES=()
+# Tracks whether --max-tokens was given on the CLI. An explicit flag always wins;
+# without it, --ultra substitutes a context-safe default (see profile block below).
+MAX_TOKENS_EXPLICIT=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -489,7 +501,7 @@ while [[ $# -gt 0 ]]; do
     --brain)            BRAIN=1; shift ;;
     --model)       MODEL_OVERRIDE="$2"; shift 2 ;;
     --endpoint)    ENDPOINT_OVERRIDE="$2"; shift 2 ;;
-    --max-tokens)  MAX_TOKENS="$2"; shift 2 ;;
+    --max-tokens)  MAX_TOKENS="$2"; MAX_TOKENS_EXPLICIT=1; shift 2 ;;
     --files)       FILES_DIR="$2"; shift 2 ;;
     --session)     SESSION="$2"; shift 2 ;;
     --system)      SYSTEM="$2"; shift 2 ;;
@@ -516,6 +528,11 @@ if [[ "$ULTRA" == 1 ]]; then
   ENDPOINT="${MAESTRODE_ULTRA_ENDPOINT:-$ENDPOINT}"
   TOOLS=1
   [[ -z "$REASONING_EFFORT" ]] && REASONING_EFFORT="${MAESTRODE_ULTRA_REASONING:-none}"
+  # The normal-muscle default (256000) reserves nearly a whole 262144-context model
+  # for output, so input + max_tokens overshoots the limit and the provider 400s
+  # before any work. The ultra muscle writes one file per tool call, so a modest
+  # output reservation is plenty. An explicit --max-tokens always wins.
+  [[ "$MAX_TOKENS_EXPLICIT" == 0 ]] && MAX_TOKENS="${MAESTRODE_ULTRA_MAX_TOKENS:-32000}"
 elif [[ "$BRAIN" == 1 ]]; then
   MODEL="${MAESTRODE_BRAIN_MODEL:-$MODEL}"
   ENDPOINT="${MAESTRODE_BRAIN_ENDPOINT:-$ENDPOINT}"
@@ -530,6 +547,20 @@ elif [[ "$BRAIN" == 1 ]]; then
 fi
 [[ -n "$MODEL_OVERRIDE" ]] && MODEL="$MODEL_OVERRIDE"
 [[ -n "$ENDPOINT_OVERRIDE" ]] && ENDPOINT="$ENDPOINT_OVERRIDE"
+
+# Optional context-window clamp. When set, the body builders reduce max_tokens so
+# (estimated input + output) fits the model's context, turning the provider's hard
+# 400 ("requested N tokens > limit") into a quiet clamp. Per-mode overrides let one
+# config point a big-context brain and a smaller-context ultra muscle at the same
+# shim. Unset (empty) = no clamp, original behavior.
+if [[ "$ULTRA" == 1 ]]; then
+  CONTEXT_LIMIT="${MAESTRODE_ULTRA_CONTEXT_LIMIT:-${MAESTRODE_CONTEXT_LIMIT:-}}"
+elif [[ "$BRAIN" == 1 ]]; then
+  CONTEXT_LIMIT="${MAESTRODE_BRAIN_CONTEXT_LIMIT:-${MAESTRODE_CONTEXT_LIMIT:-}}"
+else
+  CONTEXT_LIMIT="${MAESTRODE_CONTEXT_LIMIT:-}"
+fi
+CONTEXT_MARGIN="${MAESTRODE_CONTEXT_MARGIN:-1024}"
 
 # Protocol select (post-profile): .../v1/messages speaks the Anthropic Messages
 # API, everything else OpenAI Chat Completions. Override with MAESTRODE_PROTOCOL.
@@ -676,6 +707,7 @@ PY
   iter=0
   while [[ $iter -lt $MAX_ITERS ]]; do
     MODEL="$MODEL" MAX_TOKENS="$MAX_TOKENS" SYSTEM="$SYSTEM" PROTOCOL="$PROTOCOL" \
+    CONTEXT_LIMIT="$CONTEXT_LIMIT" CONTEXT_MARGIN="$CONTEXT_MARGIN" \
     THINK="$THINK" THINKING_TYPE="$THINKING_TYPE" THINKING_BUDGET="$THINKING_BUDGET" \
     REASONING_EFFORT="$REASONING_EFFORT" \
     python3 - "$STATE_FILE" "$PAYLOAD_FILE" <<'PY'
@@ -685,6 +717,24 @@ proto = os.environ.get("PROTOCOL") or "anthropic"
 sysmsg = os.environ.get("SYSTEM") or ""
 model = os.environ["MODEL"]
 max_tokens = int(os.environ["MAX_TOKENS"])
+
+# Context clamp: keep (estimated input + max_tokens) under the model's window so the
+# provider does not 400 on the output reservation. ~4 chars/token, same heuristic as
+# --dry-run. Skipped when CONTEXT_LIMIT is unset/0.
+ctx = int(os.environ.get("CONTEXT_LIMIT") or 0)
+if ctx > 0:
+    margin = int(os.environ.get("CONTEXT_MARGIN") or 1024)
+    est_in = (sum(len(str(m.get("content") or "")) for m in st["messages"])
+              + len(sysmsg)) // 4
+    room = ctx - est_in - margin
+    if room <= 0:
+        sys.stderr.write(f"maestrode: input ~{est_in} tok + {margin} margin exceeds "
+                         f"context {ctx}; cannot fit. shrink the brief or attached files.\n")
+        sys.exit(2)
+    if room < max_tokens:
+        sys.stderr.write(f"maestrode: clamped max_tokens {max_tokens} -> {room} "
+                         f"(context {ctx} - ~{est_in} input - {margin} margin)\n")
+        max_tokens = room
 think = (os.environ.get("THINK") or "") not in ("", "0")
 think_type = os.environ.get("THINKING_TYPE") or ""
 tb = os.environ.get("THINKING_BUDGET") or ""
@@ -901,6 +951,7 @@ fi
 
 MODEL="$MODEL" MAX_TOKENS="$MAX_TOKENS" SYSTEM="$SYSTEM" \
 SESSION_FILE="$SESSION_FILE" PROTOCOL="$PROTOCOL" \
+CONTEXT_LIMIT="$CONTEXT_LIMIT" CONTEXT_MARGIN="$CONTEXT_MARGIN" \
 REASONING_EFFORT="$REASONING_EFFORT" THINKING_BUDGET="$THINKING_BUDGET" \
 THINK="$THINK" THINKING_TYPE="$THINKING_TYPE" \
 python3 - "$PROMPT_FILE" "$PAYLOAD_FILE" <<'PY'
@@ -927,6 +978,25 @@ if messages and messages[0].get("role") == "system":
         sysmsg = messages[0].get("content") or ""
     messages = messages[1:]
 messages.append({"role": "user", "content": user_msg})
+
+# Context clamp (mirrors the tool-loop builder): keep input + max_tokens under the
+# model window so the provider does not 400 on the output reservation. Skipped when
+# CONTEXT_LIMIT is unset/0. sysmsg is counted once even though the openai branch
+# later inlines it into messages.
+ctx = int(os.environ.get("CONTEXT_LIMIT") or 0)
+if ctx > 0:
+    margin = int(os.environ.get("CONTEXT_MARGIN") or 1024)
+    est_in = (sum(len(str(m.get("content") or "")) for m in messages)
+              + len(sysmsg)) // 4
+    room = ctx - est_in - margin
+    if room <= 0:
+        sys.stderr.write(f"maestrode: input ~{est_in} tok + {margin} margin exceeds "
+                         f"context {ctx}; cannot fit. shrink the brief or attached files.\n")
+        sys.exit(2)
+    if room < max_tokens:
+        sys.stderr.write(f"maestrode: clamped max_tokens {max_tokens} -> {room} "
+                         f"(context {ctx} - ~{est_in} input - {margin} margin)\n")
+        max_tokens = room
 
 if proto == "anthropic":
     # Anthropic Messages API: system is top-level, messages are user/assistant
@@ -1405,6 +1475,13 @@ if files_written:
     for f in files_written:
         sys.stderr.write(f"  + {f}\n")
 
+# Empty output (out=0) on a plain-text call: the model burned the window reasoning
+# and emitted no content (the reported MiniMax-M3 stall). Exit 0 here is the trap:
+# a 1-byte file looks like success to any caller that only checks the exit code.
+# Fail loudly so the brain/caller falls back instead of proceeding on a blank plan.
+# (--files calls with no blocks already exit 4 above, so this guards text mode only.)
+empty_text = (not files_dir) and (not content.strip())
+
 # Append a usage record to the log so `maestrode gain` can aggregate.
 usage_log = os.environ.get("USAGE_LOG") or ""
 if usage_log:
@@ -1422,7 +1499,7 @@ if usage_log:
         "finish": finish or "stop",
         "wall": round(wall, 2),
         "files": len(files_written),
-        "exit": 0,
+        "exit": 6 if empty_text else 0,
     }
     try:
         log_path = pathlib.Path(usage_log)
@@ -1431,4 +1508,10 @@ if usage_log:
             f.write(json.dumps(record) + "\n")
     except OSError:
         pass
+
+if empty_text:
+    sys.stderr.write("maestrode: empty output (out=0): model produced no content "
+                     "(reasoning stall or window exhausted before writing). exiting 6 "
+                     "so callers do not proceed on a blank result.\n")
+    sys.exit(6)
 PY
