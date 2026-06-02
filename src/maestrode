@@ -283,8 +283,8 @@ ACTIVATE = re.compile(
     r"(?:^|\b)(?:/maestrode\b|maestrode\s+(?:on|mode|normal)\b|use\s+maestrode\b"
     r"|turn\s+on\s+maestrode\b|enable\s+maestrode\b)", re.I)
 DEACTIVATE = re.compile(
-    r"\b(?:maestrode\s+off|stop\s+maestrode|turn\s+off\s+maestrode"
-    r"|disable\s+maestrode)\b", re.I)
+    r"\b(?:turn\s+off|stop|disable)\s+/?maestrode(?:\s+(?:ultra|high|normal|mode))?\b"
+    r"|\b/?maestrode\s+off\b", re.I)
 
 def sfile(suffix=""):
     return sessions_dir / (safe + suffix)
@@ -391,21 +391,24 @@ if event == "user-prompt":
     if DEACTIVATE.search(prompt):
         clear_session()
         ups("[maestrode OFF] Mode deactivated. Resume direct authoring.")
-    # mode select: ultra > high > normal. Switching resets the drift counter.
-    new_mode = None
-    if MODE_ULTRA.search(prompt):
-        new_mode = "ultra"
-    elif MODE_HIGH.search(prompt):
-        new_mode = "high"
-    elif ACTIVATE.search(prompt):
-        new_mode = "normal"
-    if new_mode:
-        set_mode(new_mode)
-        try:
-            sfile(".direct").unlink()
-        except OSError:
-            pass
-        ups(banner_for(new_mode))
+    else:
+        # mode select: ultra > high > normal. Switching resets the drift counter.
+        # Guarded by else so an off-phrase wins even when the same prompt also
+        # contains a mode word (e.g. "turn off /maestrode ultra").
+        new_mode = None
+        if MODE_ULTRA.search(prompt):
+            new_mode = "ultra"
+        elif MODE_HIGH.search(prompt):
+            new_mode = "high"
+        elif ACTIVATE.search(prompt):
+            new_mode = "normal"
+        if new_mode:
+            set_mode(new_mode)
+            try:
+                sfile(".direct").unlink()
+            except OSError:
+                pass
+            ups(banner_for(new_mode))
     if is_active():
         mode = get_mode()
         n = read_int(sfile(".direct"))

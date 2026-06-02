@@ -89,6 +89,15 @@ out=$(hook user-prompt '{"session_id":"S1","prompt":"maestrode off"}')
 assert_contains "deactivate injects OFF" "$out" "maestrode OFF"
 assert_nofile "deactivate clears flag" "$SESS/S1"
 
+# regression: "turn off /maestrode ultra" (leading slash + trailing mode word)
+# must deactivate, NOT be re-read as activating ultra (the off-phrase has to
+# short-circuit the mode-select even though it contains "maestrode ultra").
+hook user-prompt '{"session_id":"S5","prompt":"maestrode ultra"}' >/dev/null
+assert_file "S5 ultra active" "$SESS/S5"
+out=$(hook user-prompt '{"session_id":"S5","prompt":"ok turn off /maestrode ultra"}')
+assert_contains "slash off-phrase injects OFF" "$out" "maestrode OFF"
+assert_nofile "slash off-phrase clears (no re-arm)" "$SESS/S5"
+
 echo "session-end cleanup"
 hook user-prompt '{"session_id":"S3","prompt":"use maestrode"}' >/dev/null
 assert_file "S3 active" "$SESS/S3"
