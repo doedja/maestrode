@@ -98,6 +98,34 @@ out=$(hook user-prompt '{"session_id":"S5","prompt":"ok turn off /maestrode ultr
 assert_contains "slash off-phrase injects OFF" "$out" "maestrode OFF"
 assert_nofile "slash off-phrase clears (no re-arm)" "$SESS/S5"
 
+echo "workflow mode: activation + banner"
+out=$(hook user-prompt '{"session_id":"S6","prompt":"maestrode workflow"}')
+assert_contains "workflow activates" "$out" "maestrode WORKFLOW"
+assert_contains "workflow banner names Workflow tool" "$out" "Workflow tool"
+assert_contains "workflow banner forces cheap-tier override" "$out" "cheap tier"
+assert_file "workflow writes session flag" "$SESS/S6"
+if [[ "$(head -1 "$SESS/S6")" == "workflow" ]]; then ok "mode stored as workflow"; else ko "mode stored ($(head -1 "$SESS/S6"))"; fi
+
+echo 'workflow mode: incidental "workflow mode" mention does NOT activate'
+out=$(hook user-prompt '{"session_id":"S7","prompt":"i hate workflow mode honestly"}')
+assert_empty "discussing workflow does not activate (needs maestrode adjacency)" "$out"
+assert_nofile "no flag from incidental mention" "$SESS/S7"
+
+echo "workflow mode: drift counting is suppressed (subagents ARE the muscle)"
+out=$(hook pre-tool '{"session_id":"S6","tool_name":"Task","tool_input":{}}')
+assert_empty "Task spawn silent in workflow mode" "$out"
+assert_nofile "Task does not create drift counter" "$SESS/S6.direct"
+out=$(hook pre-tool '{"session_id":"S6","tool_name":"Edit","tool_input":{"file_path":"/x.py"}}')
+assert_empty "cold edit silent in workflow mode (audit is direct)" "$out"
+assert_nofile "cold edit does not create drift counter" "$SESS/S6.direct"
+out=$(hook user-prompt '{"session_id":"S6","prompt":"next"}')
+assert_contains "standing workflow banner re-injected" "$out" "maestrode WORKFLOW"
+
+echo "workflow mode: deactivation"
+out=$(hook user-prompt '{"session_id":"S6","prompt":"turn off maestrode workflow"}')
+assert_contains "workflow off-phrase injects OFF" "$out" "maestrode OFF"
+assert_nofile "workflow off clears flag" "$SESS/S6"
+
 echo "session-end cleanup"
 hook user-prompt '{"session_id":"S3","prompt":"use maestrode"}' >/dev/null
 assert_file "S3 active" "$SESS/S3"

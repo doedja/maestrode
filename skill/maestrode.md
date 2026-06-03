@@ -1,14 +1,16 @@
 ---
 name: maestrode
 description: >
-  Delegation modes for code work (Claude Code only). Three modes: NORMAL
+  Delegation modes for code work (Claude Code only). Four modes: NORMAL
   (default) opus plans, cheap muscle drafts, opus audits; HIGH a brain model
   plans, muscle drafts, opus audits; ULTRA brain plans, premium tool-calling
-  muscle drafts, opus audits with independent spec-tests. Models are config-
-  driven via ~/.config/maestrode/env (model-agnostic). Stays on across the
-  session via session-scoped hooks until "maestrode off". Triggers: "maestrode
-  on", "maestrode high", "maestrode ultra", "maestrode mode", "use maestrode",
-  "/maestrode", or any request to route work through maestrode.
+  muscle drafts, opus audits with independent spec-tests; WORKFLOW opus plans a
+  Workflow script, cheap-tier Claude subagents draft in parallel, opus audits
+  (in-harness, no shim). Models are config-driven via ~/.config/maestrode/env
+  (model-agnostic). Stays on across the session via session-scoped hooks until
+  "maestrode off". Triggers: "maestrode on", "maestrode high", "maestrode
+  ultra", "maestrode workflow", "maestrode mode", "use maestrode", "/maestrode",
+  or any request to route work through maestrode.
 ---
 
 # maestrode modes
@@ -21,6 +23,12 @@ by the session hook (the banner each turn tells you which is active):
 | **normal** (default) | **you** | `maestrode --files` | plan + audit | small / architecture-sensitive; you keep control |
 | **high** | `maestrode --brain` | `maestrode --files` | audit only | routine bulk work; offload planning too |
 | **ultra** | `maestrode --brain` | `maestrode --ultra --files` | audit + spec-test | gnarly / algorithmic work where craft matters |
+| **workflow** | **you**, as a script | cheap-tier Claude subagents (Workflow tool) | audit + spec-test | wide work: 3+ independent files/tasks, parallel coverage |
+
+The first three offload drafting to a cheap NON-Claude model through the shim,
+so they cut opus tokens. **workflow stays in-harness**: the muscle is Claude
+subagents, not the shim, so it does not cut Claude tokens. It trades that for
+parallel fan-out and deterministic orchestration. See "workflow mode" below.
 
 Models are config-driven (`~/.config/maestrode/env`): a default muscle, a
 `--brain` planner, a `--ultra` tool muscle. Locally: deepseek (normal/high
@@ -89,14 +97,55 @@ Muscle craft is plan-dependent: a strict `--brain` plan yields clean code; a
 vague one yields fragile code (dead guards, panics/unwraps, spec-drift). Spend
 the tokens on a thorough plan.
 
+## workflow mode
+
+Different machinery from the other three. There is no shim call. You drive the
+built-in **Workflow** tool, fan the draft across Claude subagents, and audit
+what comes back. Use it when the work is WIDE (splits into 3+ independent files
+or tasks) and parallel coverage or deterministic control flow earns its keep.
+For 1-2 files or tightly sequential work, do not: the orchestration tax loses,
+use normal.
+
+Three duties, same plan/draft/audit split as the others:
+
+1. **PLAN (you).** Write the Workflow script. `phase()` per dependency tier,
+   `parallel()` for independent tasks in a tier, `pipeline()` when items flow
+   through stages, a barrier only where a tier truly depends on the previous.
+   The script is the plan, reviewable before it runs.
+2. **DRAFT (cheap-tier subagents).** Set EVERY draft `agent()` to a cheap tier
+   via the `model` option (`haiku` / `sonnet`). Keep opus for plan and audit
+   only. The whole cost cut lives in that override: without it you are running
+   opus subagents under an opus orchestrator and paying premium for parallelism
+   you could get cheaper. Force structured output with `schema`.
+3. **AUDIT (you).** Review the diff, write independent spec-tests the subagents
+   never saw, run them, fix-loop real failures. Same rule as ultra: the
+   muscle's own tests do not count.
+
+**Shared-file rule (load-bearing).** Parallel agents that touch the same file
+collide. The pattern that works:
+
+- A **foundation agent** owns every shared / wiring file (build manifest,
+  router, module registrations) and writes compiling stubs for the rest.
+- Every later agent owns exactly ONE file's body, told to touch no other file.
+- A **gate agent** (or you) compiles once per tier on a single designated step;
+  concurrent builds in one target dir serialize, so do not fan out the build.
+
+Without this, each agent reports success against its own draft while the merged
+tree fails to compile. (Worktree isolation is the wrong tool here: the output
+must be one merged compiling tree, not N divergent copies.)
+
+The drift counter is suppressed in this mode: spawning subagents and editing
+during the audit ARE the expected path, not a bypass, so the hook does not nag.
+
 ## Persistence is hook-driven (you do not have to self-remind)
 
 The installer registers three Claude Code hooks that key all state to
 `session_id` under `~/.config/maestrode/sessions/<session_id>`:
 
 - **UserPromptSubmit** captures the mode from your words ("maestrode on" =
-  normal, "maestrode high", "maestrode ultra", "maestrode off") and injects a
-  mode-specific banner (`[maestrode NORMAL|HIGH|ULTRA]`) into your context every
+  normal, "maestrode high", "maestrode ultra", "maestrode workflow", "maestrode
+  off") and injects a mode-specific banner
+  (`[maestrode NORMAL|HIGH|ULTRA|WORKFLOW]`) into your context every
   turn while active. The banner states that mode's orchestration (who plans,
   which muscle), so you cannot drift off-mode the way a brain-emitted footer tag
   faded. Switching modes mid-session just re-says it and resets drift. When you

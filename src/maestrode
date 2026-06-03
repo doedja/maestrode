@@ -274,16 +274,21 @@ BANNER = (
     "or let the muscle draft directly."
 )
 
-# Three modes (Claude Code only). normal: opus plans, muscle drafts. high:
+# Four modes (Claude Code only). normal: opus plans, muscle drafts. high:
 # brain model plans, muscle drafts, opus audits. ultra: brain plans, premium
-# tool muscle drafts, opus audits + spec-tests. Check ultra > high > normal.
+# tool muscle drafts, opus audits + spec-tests. workflow: opus plans as a
+# Workflow script, cheap-tier Claude subagents draft in parallel, opus audits.
+# Check ultra > high > workflow > normal.
 MODE_ULTRA = re.compile(r"\bmaestrode\s+ultra\b", re.I)
 MODE_HIGH = re.compile(r"\bmaestrode\s+high\b", re.I)
+# Require "maestrode" adjacency like ultra/high. A bare "workflow mode" trigger
+# false-fires when the feature is merely discussed ("i hate workflow mode").
+MODE_WORKFLOW = re.compile(r"\bmaestrode\s+workflow\b", re.I)
 ACTIVATE = re.compile(
     r"(?:^|\b)(?:/maestrode\b|maestrode\s+(?:on|mode|normal)\b|use\s+maestrode\b"
     r"|turn\s+on\s+maestrode\b|enable\s+maestrode\b)", re.I)
 DEACTIVATE = re.compile(
-    r"\b(?:turn\s+off|stop|disable)\s+/?maestrode(?:\s+(?:ultra|high|normal|mode))?\b"
+    r"\b(?:turn\s+off|stop|disable)\s+/?maestrode(?:\s+(?:ultra|high|normal|workflow|mode))?\b"
     r"|\b/?maestrode\s+off\b", re.I)
 
 def sfile(suffix=""):
@@ -292,7 +297,7 @@ def sfile(suffix=""):
 def is_active():
     return bool(safe) and sfile().exists()
 
-VALID_MODES = ("normal", "high", "ultra")
+VALID_MODES = ("normal", "high", "ultra", "workflow")
 
 def set_mode(mode):
     # session file stores "<mode>\n<activation-ts>". Legacy files held just a ts.
@@ -321,6 +326,17 @@ def banner_for(mode):
             "(2) DRAFT: maestrode --files out/ \"<implement the plan>\"  "
             "(3) AUDIT (you): run tests, fix-loop, apply. Routine bulk work; you "
             "plan nothing and draft nothing, only review.")
+    if mode == "workflow":
+        return (
+            "[maestrode WORKFLOW] Parallel delegation via the Workflow tool; muscle "
+            "is cheap-tier Claude subagents, not the shim. "
+            "(1) PLAN: write the Workflow script (a foundation agent owns shared "
+            "files, one file per draft agent, a gate agent compiles). "
+            "(2) DRAFT: set every draft agent's model to a cheap tier (e.g. "
+            "haiku/sonnet), opus for plan + audit only, or you pay opus for "
+            "parallelism. "
+            "(3) AUDIT (you): independent spec-tests the agents never saw, fix-loop. "
+            "Use ONLY for 3+ independent files/tasks; 1-2 files, draft inline.")
     return "[maestrode ON] " + BANNER
 
 def clear_session():
@@ -400,6 +416,8 @@ if event == "user-prompt":
             new_mode = "ultra"
         elif MODE_HIGH.search(prompt):
             new_mode = "high"
+        elif MODE_WORKFLOW.search(prompt):
+            new_mode = "workflow"
         elif ACTIVATE.search(prompt):
             new_mode = "normal"
         if new_mode:
@@ -436,6 +454,11 @@ if event == "pre-tool":
                     pass
         silent()
     if not is_active():
+        silent()
+    if get_mode() == "workflow":
+        # workflow muscle IS Claude subagents and the audit IS direct edits, so
+        # Task spawns and cold edits are the expected path, not drift. Skip the
+        # bypass counting that the shim-delegation modes rely on.
         silent()
     if tool == "Task":
         # A subagent spawn while in mode is a bypass: count it so the next-turn
