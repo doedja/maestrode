@@ -9,7 +9,7 @@
 
 Claude is uniquely good at one of the two jobs per turn: thinking. Writing file contents is interchangeable. maestrode keeps Claude as the brain (plan, review, iterate) and routes the drafting to a cheap OpenAI-compatible or Anthropic-compatible model via a bash shim. A session-scoped hook keeps the mode on across turns so it never silently fades.
 
-## Three modes
+## Four modes
 
 Set by what you say in Claude Code. The hook re-injects a banner each turn so the mode sticks.
 
@@ -18,8 +18,11 @@ Set by what you say in Claude Code. The hook re-injects a banner each turn so th
 | **normal** (default) | Claude | cheap muscle | plan + audit | small / architecture-sensitive work |
 | **high** | brain model | cheap muscle | audit only | routine bulk work; offload planning too |
 | **ultra** | brain model | tool-calling muscle | audit + spec-test | gnarly / algorithmic work where craft matters |
+| **workflow** | Claude (as a script) | cheap-tier Claude subagents | audit + spec-test | wide work: 3+ independent files/tasks, parallel |
 
 Only **normal** spends Claude tokens on planning. **high** and **ultra** hand planning to a cheaper "brain" model too, so Claude only reviews. **ultra** adds a tool-calling muscle (the model writes files through a real `write_file` tool, not text blocks) and an independent spec-test loop for the hard tasks.
+
+**workflow** is the odd one. It does not use the shim and does not cut Claude tokens: the muscle is cheap-tier Claude subagents (set each draft agent to haiku/sonnet) fanned out by Claude Code's built-in Workflow tool. You trade the token savings for parallel drafting and deterministic, in-harness orchestration. Use it only when the work splits into 3+ independent files or tasks; for one or two files the orchestration overhead loses, so use normal.
 
 Models are config-driven, so it stays model-agnostic. A sensible local setup:
 
@@ -56,7 +59,7 @@ Then edit `~/.config/maestrode/env` (see above) and you're set.
 
 ### Use it
 
-In Claude Code, say **`maestrode on`** (normal), **`maestrode high`**, or **`maestrode ultra`**. The mode stays on for the rest of the session and Claude routes drafting to the muscle. Say **`maestrode off`** to drop back to direct authoring.
+In Claude Code, say **`maestrode on`** (normal), **`maestrode high`**, **`maestrode ultra`**, or **`maestrode workflow`**. The mode stays on for the rest of the session and Claude routes drafting to the muscle. Say **`maestrode off`** to drop back to direct authoring.
 
 Persistence is hook-driven: the installer registers three Claude Code hooks (UserPromptSubmit, PreToolUse, SessionEnd) that key all state to `session_id`, so the active mode sticks across turns without the model remembering it and never leaks into another session. Opt out with `MAESTRODE_NO_HOOKS=1`.
 
