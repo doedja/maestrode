@@ -110,6 +110,11 @@
 
 set -euo pipefail
 
+# Capture whether the caller pinned a custom config dir BEFORE defaulting it:
+# an explicit MAESTRODE_CONFIG_DIR signals a sandbox or relocated install (the
+# test suite, throwaway experiments), which the usage-log resolver keeps isolated
+# from the shared ccusage scan dir.
+_cfg_explicit="${MAESTRODE_CONFIG_DIR:+1}"
 CONFIG_DIR="${MAESTRODE_CONFIG_DIR:-${HOME}/.config/maestrode}"
 ENV_FILE="${CONFIG_DIR}/env"
 # Load env file as DEFAULTS: a var already set in the caller's environment
@@ -131,8 +136,13 @@ fi
 # (a path ending in /projects is normalized to its parent), else ~/.claude.
 # Writing into <base>/projects/maestrode/ self-bootstraps that base into
 # ccusage's default scan. Override the file outright with MAESTRODE_USAGE_LOG.
+# An explicit MAESTRODE_CONFIG_DIR (sandbox/relocated install) keeps the log
+# beside that config instead, so test fixtures and throwaway runs never pollute
+# real ccusage stats; set MAESTRODE_USAGE_LOG to force the ccusage path anyway.
 if [[ -n "${MAESTRODE_USAGE_LOG:-}" ]]; then
   USAGE_LOG="$MAESTRODE_USAGE_LOG"
+elif [[ -n "$_cfg_explicit" ]]; then
+  USAGE_LOG="${CONFIG_DIR}/usage.jsonl"
 else
   _ccbase="${CLAUDE_CONFIG_DIR%%,*}"        # first comma-separated entry
   [[ -z "$_ccbase" ]] && _ccbase="${HOME}/.claude"
@@ -140,6 +150,7 @@ else
   USAGE_LOG="${_ccbase}/projects/maestrode/usage.jsonl"
   unset _ccbase
 fi
+unset _cfg_explicit
 
 # Subcommand: `maestrode hook <event>` drives the Claude Code persistence hooks.
 # Reads the hook JSON payload from stdin, keys all state to session_id, and

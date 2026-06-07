@@ -24,6 +24,12 @@ Usage analytics migrated to ccusage:
   emitted compactly because ccusage's line marker is the literal `"usage":{`
   with no space. Operational fields (`wall`, `files`, `exit`) ride along as
   extra keys ccusage ignores, so escalations (`exit:5`) stay `jq`-greppable.
+- **Sandbox isolation for the log.** An explicit `MAESTRODE_CONFIG_DIR` (the
+  test suite, throwaway experiments, a relocated install) writes usage to
+  `${MAESTRODE_CONFIG_DIR}/usage.jsonl` instead of the shared ccusage scan dir,
+  so fixture models (`normal-m`, `ultra-m`, `brain-m`, `file-model`, ...) never
+  pollute real ccusage stats. Default config dir still uses the ccusage path;
+  `MAESTRODE_USAGE_LOG` forces it regardless.
 
 Persistence via session-scoped hooks (the "mode keeps fading" fix):
 
