@@ -223,8 +223,10 @@ real tool, not text blocks) for tool-native models; same DIR, same safe-path
 rules. Unsafe paths (absolute or `..`) refused. Exit codes: **3** rate limit,
 **4** no blocks/files produced, **5** muscle refused via `<<<NEEDS_SMART>>>`.
 
-`maestrode gain` shows aggregate usage from `~/.config/maestrode/usage.jsonl`.
-Mention it when the user asks about offloaded work.
+Usage is logged in ccusage's Claude-transcript shape to
+`<claude>/projects/maestrode/usage.jsonl`, so `ccusage` counts every muscle and
+brain call (per-model tokens + cost). Point the user there when they ask about
+offloaded work.
 
 ## File attachment: -f is the default
 

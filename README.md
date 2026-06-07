@@ -76,15 +76,16 @@ curl -fsSL https://raw.githubusercontent.com/doedja/maestrode/main/install.sh | 
 
 [OpenCode Zen Go](https://opencode.ai/go?ref=RYMKY9AQS9) is the cheapest path I've found: $10/mo gets ~$60 of DeepSeek, MiniMax, Kimi, Qwen, GLM, all behind one key, on both the OpenAI and Anthropic endpoints maestrode uses. (Referral link; non-ref is `opencode.ai/go`.) Any OpenAI-compatible or Anthropic-compatible endpoint also works (DeepSeek direct, OpenRouter, ollama, the official Anthropic API).
 
-## Aggregate stats
+## Aggregate stats (via ccusage)
 
-Every call appends a JSONL record to `~/.config/maestrode/usage.jsonl`.
+Every muscle/brain call appends a record in [ccusage](https://github.com/ryoppippi/ccusage)'s Claude-transcript shape to `<claude>/projects/maestrode/usage.jsonl`, where `<claude>` is the first `CLAUDE_CONFIG_DIR` entry (a path ending in `/projects` normalizes to its parent) or `~/.claude`. ccusage scans that directory by default, so:
 
 ```bash
-maestrode gain
+ccusage               # maestrode shows up as a `maestrode` project
+ccusage --breakdown   # per-model token + cost breakdown
 ```
 
-Prints totals (tokens by kind, per-model breakdown, wall time) over the full log. Read the raw numbers and infer the Claude-cost-equivalent yourself.
+Cost comes from ccusage's bundled LiteLLM pricing keyed on the model name the provider returns (deepseek, minimax, kimi, qwen, etc. are covered; models it does not know show tokens with `$0` and a "missing pricing" flag). Override the file location with `MAESTRODE_USAGE_LOG`. Each record also carries `wall`, `files`, and `exit` keys (ignored by ccusage) for `jq` forensics, e.g. escalations are `exit:5`.
 
 ## Pairs well with
 

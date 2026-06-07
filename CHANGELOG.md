@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+Usage analytics migrated to ccusage:
+
+- **`maestrode gain` removed; ccusage is now the usage surface.** Each muscle and
+  brain call writes its record in [ccusage](https://github.com/ryoppippi/ccusage)'s
+  Claude-transcript shape (`message.usage` with `input_tokens` / `output_tokens` /
+  `cache_creation_input_tokens` / `cache_read_input_tokens`, tz-aware
+  `timestamp`, no `message.id` so every call counts) instead of the bespoke
+  `gain` format.
+- **Log moved to a ccusage-scanned path.** Default
+  `<claude>/projects/maestrode/usage.jsonl`, where `<claude>` is the first
+  `CLAUDE_CONFIG_DIR` entry (a path ending in `/projects` normalizes to its
+  parent) or `~/.claude`. Plain `ccusage` then lists a `maestrode` project with
+  a per-model token + cost breakdown; cost is priced by ccusage's bundled
+  LiteLLM table from the provider's model name (no `costUSD` embedded). Override
+  with `MAESTRODE_USAGE_LOG`.
+- **Correct token mapping.** Input is split per protocol (openai `prompt_tokens`
+  includes the cached read, anthropic `input_tokens` excludes it), the cached
+  portion lands in `cache_read_input_tokens`, and reasoning folds into
+  `output_tokens` so the grand total matches what the provider billed. JSON is
+  emitted compactly because ccusage's line marker is the literal `"usage":{`
+  with no space. Operational fields (`wall`, `files`, `exit`) ride along as
+  extra keys ccusage ignores, so escalations (`exit:5`) stay `jq`-greppable.
+
 Persistence via session-scoped hooks (the "mode keeps fading" fix):
 
 - **`maestrode hook <event>` subcommand.** New stdin-driven subcommand for

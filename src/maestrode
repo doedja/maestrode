@@ -16,7 +16,6 @@
 #   maestrode --session arm-b --system "You are a senior engineer." "follow-up turn"
 #   maestrode --full "include reasoning trace"
 #   maestrode --model gpt-5.1-codex "swap model"
-#   maestrode gain                 show aggregate usage stats from the local log
 #   maestrode hook <event>         Claude Code persistence hook (stdin JSON);
 #                                  event in: user-prompt, pre-tool, session-end
 #
@@ -94,6 +93,14 @@
 #   MAESTRODE_STALL_TIMEOUT  streaming idle guard: abort if no bytes flow for this
 #                            many seconds; default: 30
 #   MAESTRODE_ALLOW_SECRETS  set to 1 to bypass the secret-pattern scan
+#   MAESTRODE_USAGE_LOG      override the usage-record file. Default:
+#                            <claude>/projects/maestrode/usage.jsonl, where
+#                            <claude> is the first CLAUDE_CONFIG_DIR entry (a path
+#                            ending in /projects normalizes to its parent) or
+#                            ~/.claude. Records are written in ccusage's Claude
+#                            transcript shape, so `ccusage` counts every muscle
+#                            and brain call (per-model tokens + cost via its
+#                            bundled LiteLLM pricing) with no extra setup.
 #
 # exit codes:
 #   0 ok, 1 transport error, 2 api error, 3 rate limit (429),
@@ -105,7 +112,6 @@ set -euo pipefail
 
 CONFIG_DIR="${MAESTRODE_CONFIG_DIR:-${HOME}/.config/maestrode}"
 ENV_FILE="${CONFIG_DIR}/env"
-USAGE_LOG="${CONFIG_DIR}/usage.jsonl"
 # Load env file as DEFAULTS: a var already set in the caller's environment
 # (e.g. `MAESTRODE_ENDPOINT=... maestrode ...`) wins over the file. Sourcing
 # with `. "$ENV_FILE"` would instead clobber caller overrides, so apply each
@@ -118,107 +124,21 @@ if [[ -f "$ENV_FILE" ]]; then
   unset _k _v
 fi
 
-# Subcommand: `maestrode gain` prints aggregate stats from the usage log.
-# No API key needed for this path.
-if [[ "${1:-}" == "gain" ]]; then
-  shift
-  USAGE_LOG="$USAGE_LOG" python3 - "$@" <<'PY'
-import json, os, sys, datetime, pathlib
-
-log = pathlib.Path(os.environ["USAGE_LOG"])
-if not log.exists() or log.stat().st_size == 0:
-    print("maestrode gain: no usage logged yet at", log)
-    print("(usage logs are appended after each successful call)")
-    sys.exit(0)
-
-rows = []
-for line in log.read_text().splitlines():
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        rows.append(json.loads(line))
-    except json.JSONDecodeError:
-        continue
-
-if not rows:
-    print("maestrode gain: usage log exists but no valid entries")
-    sys.exit(0)
-
-def human(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.0f}k"
-    return str(n)
-
-def hms(s: float) -> str:
-    s = int(s)
-    if s < 60:
-        return f"{s}s"
-    m, s = divmod(s, 60)
-    if m < 60:
-        return f"{m}m {s:02d}s"
-    h, m = divmod(m, 60)
-    return f"{h}h {m:02d}m {s:02d}s"
-
-first_ts = min(r.get("ts", "") for r in rows if r.get("ts"))
-last_ts  = max(r.get("ts", "") for r in rows if r.get("ts"))
-def parse_ts(s):
-    try:
-        return datetime.datetime.fromisoformat(s)
-    except Exception:
-        return None
-first_dt, last_dt = parse_ts(first_ts), parse_ts(last_ts)
-span_days = ""
-if first_dt and last_dt:
-    days = max(1, (last_dt - first_dt).days + 1)
-    span_days = f" ({days} day{'s' if days != 1 else ''})"
-
-total_calls = len(rows)
-total_prompt = sum(r.get("prompt", 0) for r in rows)
-total_out    = sum(r.get("out", 0) for r in rows)
-total_reason = sum(r.get("reason", 0) for r in rows)
-total_wall   = sum(r.get("wall", 0) for r in rows)
-
-by_model = {}
-for r in rows:
-    m = r.get("model", "?")
-    d = by_model.setdefault(m, {"calls": 0, "tokens": 0})
-    d["calls"]  += 1
-    d["tokens"] += r.get("prompt", 0) + r.get("out", 0) + r.get("reason", 0)
-
-by_exit = {}
-for r in rows:
-    code = r.get("exit", 0)
-    label = {0: "ok", 5: "NEEDS_SMART", 3: "rate-limit (429)", 2: "api error", 4: "no blocks parsed"}.get(code, f"exit {code}")
-    by_exit[label] = by_exit.get(label, 0) + 1
-
-total_tokens = total_prompt + total_out + total_reason
-date_label = first_dt.date().isoformat() if first_dt else "?"
-
-print()
-print("maestrode gain")
-print(f"  since {date_label}{span_days} ({total_calls} call{'s' if total_calls != 1 else ''})")
-print()
-print(f"  muscle handled:")
-print(f"    {human(total_tokens)} tokens  ({human(total_prompt)} prompt / {human(total_out)} output / {human(total_reason)} reasoning)")
-print()
-print(f"  by model:")
-for m, d in sorted(by_model.items(), key=lambda kv: -kv[1]["tokens"]):
-    print(f"    {m:<22} {d['calls']:>3} calls  {human(d['tokens']):>6} tokens")
-print()
-if len(by_exit) > 1 or "ok" not in by_exit:
-    print(f"  by exit:")
-    for label, count in sorted(by_exit.items(), key=lambda kv: -kv[1]):
-        print(f"    {label:<22} {count}")
-    print()
-avg = total_wall / total_calls if total_calls else 0
-print(f"  wall time: {hms(total_wall)} total (avg {hms(avg)}/call)")
-print()
-sys.exit(0)
-PY
-  exit $?
+# Usage records are written in ccusage's Claude-transcript shape so `ccusage`
+# counts maestrode muscle/brain calls natively (per-model tokens + cost via its
+# bundled LiteLLM pricing). They must live under a directory ccusage scans, so
+# the base mirrors ccusage's own discovery: the first CLAUDE_CONFIG_DIR entry
+# (a path ending in /projects is normalized to its parent), else ~/.claude.
+# Writing into <base>/projects/maestrode/ self-bootstraps that base into
+# ccusage's default scan. Override the file outright with MAESTRODE_USAGE_LOG.
+if [[ -n "${MAESTRODE_USAGE_LOG:-}" ]]; then
+  USAGE_LOG="$MAESTRODE_USAGE_LOG"
+else
+  _ccbase="${CLAUDE_CONFIG_DIR%%,*}"        # first comma-separated entry
+  [[ -z "$_ccbase" ]] && _ccbase="${HOME}/.claude"
+  [[ "$(basename "$_ccbase")" == "projects" ]] && _ccbase="$(dirname "$_ccbase")"
+  USAGE_LOG="${_ccbase}/projects/maestrode/usage.jsonl"
+  unset _ccbase
 fi
 
 # Subcommand: `maestrode hook <event>` drives the Claude Code persistence hooks.
@@ -444,7 +364,9 @@ if event == "pre-tool":
     tin = payload.get("tool_input") or {}
     if tool == "Bash":
         cmd = (tin.get("command") or "").lstrip()
-        # A real muscle delegation (not `maestrode hook`/`gain`) resets drift.
+        # A real muscle delegation (not the `hook`/`gain` subcommands; `gain` was
+        # removed in favor of ccusage but stays excluded so a stray call to it is
+        # not miscounted as delegation) resets drift.
         if re.match(r"maestrode\b", cmd) and not re.match(r"maestrode\s+(?:hook|gain)\b", cmd):
             if is_active():
                 sfile(".lastcall").write_text(str(time.time()))
@@ -968,6 +890,7 @@ PY
     echo "maestrode: hit tool-loop cap ($MAX_ITERS iters); model still calling tools. raise MAESTRODE_TOOL_ITERS." >&2
   fi
   FULL="$FULL" CALL_T0="$CALL_T0" USAGE_LOG="$USAGE_LOG" MODEL="$MODEL" ITERS="$iter" \
+  PROTOCOL="$PROTOCOL" \
   python3 - "$STATE_FILE" <<'PY'
 import json, os, sys, time, datetime, pathlib
 st = json.load(open(sys.argv[1]))
@@ -988,13 +911,21 @@ if not files:
     sys.stderr.write("maestrode: no files written (model made no write_file calls)\n")
 log = os.environ.get("USAGE_LOG") or ""
 if log:
-    rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
-           "model": os.environ.get("MODEL") or "", "prompt": prompt, "out": u["out"],
-           "reason": 0, "cache_hit": u["cache"], "cache_miss": u["in"],
-           "finish": "stop", "wall": wall, "files": len(files), "exit": 0 if files else 4}
+    # ccusage Claude-transcript shape: compact JSON (its marker is `"usage":{`,
+    # no space) under <claude>/projects/maestrode/, no message.id so every call
+    # counts (id+requestId is its dedupe key). openai prompt_tokens includes the
+    # cached read; anthropic input_tokens excludes it, so split per protocol.
+    cache_read = u["cache"]
+    inp = max(u["in"] - cache_read, 0) if (os.environ.get("PROTOCOL") or "openai") == "openai" else u["in"]
+    rec = {"timestamp": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+           "message": {"model": os.environ.get("MODEL") or "unknown",
+                       "usage": {"input_tokens": inp, "output_tokens": u["out"],
+                                 "cache_creation_input_tokens": 0,
+                                 "cache_read_input_tokens": cache_read}},
+           "wall": wall, "files": len(files), "exit": 0 if files else 4}
     p = pathlib.Path(log); p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a") as f:
-        f.write(json.dumps(rec) + "\n")
+        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
 sys.exit(0 if files else 4)
 PY
   exit $?
@@ -1370,7 +1301,7 @@ fi
 
 FULL="$FULL" RAW="$RAW" FILES_DIR="$FILES_DIR" \
 PROMPT_FILE="$PROMPT_FILE" SESSION_FILE="$SESSION_FILE" \
-USAGE_LOG="$USAGE_LOG" CALL_T0="$CALL_T0" \
+USAGE_LOG="$USAGE_LOG" CALL_T0="$CALL_T0" MODEL="$MODEL" \
 python3 - "$RESP_FILE" <<'PY'
 import json, os, sys, re, pathlib
 
@@ -1422,7 +1353,7 @@ if esc:
     why = (esc.group(1) or "").strip() or "(no reason given)"
     sys.stderr.write(f"maestrode: muscle escalated. reason: {why}\n")
     sys.stderr.write("hint: handle this turn with the smart model directly.\n")
-    # Log the escalation so `maestrode gain` reflects it.
+    # Log the escalation so ccusage reflects it (exit 5 kept as a forensic field).
     usage_log = os.environ.get("USAGE_LOG") or ""
     if usage_log:
         import datetime, time
@@ -1435,19 +1366,21 @@ if esc:
         miss_ = u.get("prompt_cache_miss_tokens", 0)
         t0 = float(os.environ.get("CALL_T0") or 0) or time.time()
         wall = max(0.0, time.time() - t0)
+        # ccusage Claude-transcript shape (compact JSON, marker `"usage":{`).
+        # input = total prompt minus cached read; output folds reasoning in (ct).
         record = {
-            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
-            "model": resp.get("model") or "",
-            "prompt": pt_, "out": out_, "reason": rt_,
-            "cache_hit": hit_, "cache_miss": miss_,
-            "finish": choice.get("finish_reason") or "stop",
+            "timestamp": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "message": {"model": resp.get("model") or os.environ.get("MODEL") or "unknown",
+                        "usage": {"input_tokens": max(pt_ - hit_, 0), "output_tokens": ct,
+                                  "cache_creation_input_tokens": 0,
+                                  "cache_read_input_tokens": hit_}},
             "wall": round(wall, 2), "files": 0, "exit": 5,
         }
         try:
             log_path = pathlib.Path(usage_log)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a") as f:
-                f.write(json.dumps(record) + "\n")
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
         except OSError:
             pass
     sys.exit(5)
@@ -1543,21 +1476,25 @@ if files_written:
 # (--files calls with no blocks already exit 4 above, so this guards text mode only.)
 empty_text = (not files_dir) and (not content.strip())
 
-# Append a usage record to the log so `maestrode gain` can aggregate.
+# Append a usage record in ccusage's Claude-transcript shape so `ccusage` counts
+# this muscle/brain call natively. Compact JSON (its marker is `"usage":{`, no
+# space). input = total prompt minus cached read; output folds reasoning in (ct).
 usage_log = os.environ.get("USAGE_LOG") or ""
 if usage_log:
     import datetime, time
     t0 = float(os.environ.get("CALL_T0") or 0) or time.time()
     wall = max(0.0, time.time() - t0)
     record = {
-        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
-        "model": resp.get("model") or "",
-        "prompt": pt if isinstance(pt, int) else 0,
-        "out": out_t if isinstance(out_t, int) else 0,
-        "reason": rt if isinstance(rt, int) else 0,
-        "cache_hit": hit if isinstance(hit, int) else 0,
-        "cache_miss": miss if isinstance(miss, int) else 0,
-        "finish": finish or "stop",
+        "timestamp": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "message": {
+            "model": resp.get("model") or os.environ.get("MODEL") or "unknown",
+            "usage": {
+                "input_tokens": max((pt or 0) - (hit or 0), 0),
+                "output_tokens": ct,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": hit or 0,
+            },
+        },
         "wall": round(wall, 2),
         "files": len(files_written),
         "exit": 6 if empty_text else 0,
@@ -1566,7 +1503,7 @@ if usage_log:
         log_path = pathlib.Path(usage_log)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a") as f:
-            f.write(json.dumps(record) + "\n")
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
     except OSError:
         pass
 
