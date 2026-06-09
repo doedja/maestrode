@@ -91,8 +91,9 @@ Cost comes from ccusage's bundled LiteLLM pricing keyed on the model name the pr
 
 - [rtk](https://www.rtk-ai.app/) (`brew install rtk`): token-compact rewrites of `ls`, `git`, `gh`, `tree`, `read` output.
 - [caveman](https://github.com/JuliusBrussee/caveman) skill: ultra-compressed chat output.
+- [context-mode](https://github.com/mksglu/context-mode) (`claude mcp add context-mode -- npx -y context-mode`, or the full marketplace plugin): runs commands, file reads, and web fetches in a sandbox and indexes the output to a searchable store, so raw bytes never enter context. You retrieve only the derived answer.
 
-Stack all three and Claude tokens drop at every layer: shell output (rtk), chat replies (caveman), code drafting (maestrode).
+Stack all four and Claude tokens drop at every layer: large tool/file/web output (context-mode keeps it out of context), shell output that still comes back (rtk compresses it), chat replies (caveman), code drafting (maestrode). rtk and context-mode both touch tool output but do not collide: context-mode prevents the bytes from entering, rtk shrinks whatever you still pull in directly.
 
 ## Notes
 
