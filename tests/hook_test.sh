@@ -144,6 +144,29 @@ python3 -c "import os,time;p='$old';t=time.time()-8*86400;os.utime(p,(t,t))"
 hook user-prompt '{"session_id":"S4","prompt":"hi"}' >/dev/null
 assert_nofile "8-day-old session reaped" "$old"
 
+echo "== install_hooks prunes a stale-format maestrode hook (no duplicate) =="
+# Pull the embedded registration python out of install.sh and run it against a
+# settings file that already holds an OLD-format maestrode pre-tool entry plus an
+# unrelated hook. Re-registering the new (printf %q quoted) command must converge
+# to a single maestrode entry and leave the unrelated hook intact.
+INSTALL_SH="${SCRIPT_DIR}/../install.sh"
+PRUNE_PY="$TMP/prune.py"
+awk '/python3 - "\$SETTINGS_FILE" \\$/{f=1} f&&/<<.PY.$/{f=2;next} f==2&&/^PY$/{exit} f==2{print}' "$INSTALL_SH" > "$PRUNE_PY"
+HSET="$TMP/hook_settings.json"
+cat > "$HSET" <<'JEOF'
+{"hooks":{"PreToolUse":[
+  {"matcher":"Edit","hooks":[{"type":"command","command":"[ -n \"$(ls -A '/c/sessions' 2>/dev/null)\" ] && exec '/i/maestrode' hook pre-tool || exit 0"}]},
+  {"matcher":"Bash","hooks":[{"type":"command","command":"some-other-tool hook pre-tool"}]}
+]}}
+JEOF
+NEWPRE="[ -n \"\$(ls -A $(printf '%q' '/c/sessions') 2>/dev/null)\" ] && exec $(printf '%q' '/i/maestrode') hook pre-tool || exit 0"
+python3 "$PRUNE_PY" "$HSET" "PreToolUse" "Edit|Write" "$NEWPRE" >/dev/null
+python3 "$PRUNE_PY" "$HSET" "PreToolUse" "Edit|Write" "$NEWPRE" >/dev/null  # idempotent re-run
+mcount=$(python3 -c "import json;s=json.load(open('$HSET'));print(sum(1 for e in s['hooks']['PreToolUse'] for h in e['hooks'] if 'maestrode' in h['command']))")
+ocount=$(python3 -c "import json;s=json.load(open('$HSET'));print(sum(1 for e in s['hooks']['PreToolUse'] for h in e['hooks'] if h['command']=='some-other-tool hook pre-tool'))")
+[[ "$mcount" == "1" ]] && ok "exactly one maestrode pre-tool hook after re-register" || ko "got $mcount maestrode pre-tool hooks"
+[[ "$ocount" == "1" ]] && ok "unrelated hook preserved" || ko "unrelated hook lost ($ocount)"
+
 echo
 echo "hook tests: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

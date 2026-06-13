@@ -139,7 +139,7 @@ install_hooks() {
     "UserPromptSubmit" ""                       "$(maestrode_hook_cmd user-prompt)" \
     "PreToolUse"       "$HOOK_PRETOOL_MATCHER"   "$(maestrode_hook_cmd pre-tool)" \
     "SessionEnd"       ""                        "$(maestrode_hook_cmd session-end)" <<'PY'
-import json, os, sys
+import json, os, re, sys
 settings_path = sys.argv[1]
 # remaining args are (event, matcher, command) triples
 triples = []
@@ -160,6 +160,27 @@ hooks = d.setdefault("hooks", {})
 changed = False
 for event, matcher, command in triples:
     entries = hooks.setdefault(event, [])
+    # Prune any STALE maestrode hook for this subcommand: an earlier install
+    # that wrote a different command string (e.g. pre-flight quoting changed)
+    # leaves an orphan the exact-match check below would never replace, so
+    # re-install would accumulate duplicates. Match a maestrode hook by its
+    # `hook <sub>` signature; keep the canonical command and all non-maestrode
+    # hooks untouched.
+    m = re.search(r"hook (user-prompt|pre-tool|session-end)", command)
+    if m:
+        sig = "hook " + m.group(1)
+        kept_entries = []
+        for entry in entries:
+            kept = [hh for hh in entry.get("hooks", [])
+                    if not ("maestrode" in hh.get("command", "")
+                            and sig in hh.get("command", "")
+                            and hh.get("command") != command)]
+            if len(kept) != len(entry.get("hooks", [])):
+                changed = True
+            if kept:
+                entry["hooks"] = kept
+                kept_entries.append(entry)
+        entries[:] = kept_entries
     # already present (same command anywhere in this event)? skip.
     if any(hh.get("command") == command
            for entry in entries for hh in entry.get("hooks", [])):
