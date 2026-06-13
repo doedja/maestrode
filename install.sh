@@ -114,7 +114,10 @@ PY
 maestrode_hook_cmd() {
   case "$1" in
     pre-tool)
-      printf '%s' "[ -n \"\$(ls -A '${CONFIG_DIR}/sessions' 2>/dev/null)\" ] && exec '${INSTALL_DIR}/maestrode' hook pre-tool || exit 0" ;;
+      # Shell-quote the embedded paths with %q so a CONFIG_DIR/INSTALL_DIR override
+      # containing a single quote (or other metachar) can't break or inject into
+      # the hook command string. Default paths quote to themselves (no change).
+      printf '%s' "[ -n \"\$(ls -A $(printf '%q' "${CONFIG_DIR}/sessions") 2>/dev/null)\" ] && exec $(printf '%q' "${INSTALL_DIR}/maestrode") hook pre-tool || exit 0" ;;
     *)
       printf '%s' "${INSTALL_DIR}/maestrode hook $1" ;;
   esac
