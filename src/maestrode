@@ -124,6 +124,11 @@ ENV_FILE="${CONFIG_DIR}/env"
 if [[ -f "$ENV_FILE" ]]; then
   while IFS='=' read -r _k _v; do
     [[ "$_k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    # Strip a trailing inline comment (whitespace + #...) so a line like
+    # `MAESTRODE_MODEL=foo # note` yields `foo`, not `foo # note`. A '#' with no
+    # leading whitespace (e.g. a URL fragment) is kept. Full-line comments are
+    # already skipped: the key regex rejects a leading '#'.
+    _v="${_v%%[[:space:]]#*}"
     [[ -z "${!_k:-}" ]] && export "$_k=$_v"
   done < "$ENV_FILE"
   unset _k _v
@@ -555,7 +560,9 @@ STREAM_TIMEOUT="${MAESTRODE_STREAM_TIMEOUT:-${MAESTRODE_CURL_TIMEOUT:-1800}}"
 
 # Protocol select (post-profile): .../v1/messages speaks the Anthropic Messages
 # API, everything else OpenAI Chat Completions. Override with MAESTRODE_PROTOCOL.
-case "$ENDPOINT" in
+# Strip any query string / fragment first so `.../messages?foo=bar` still matches.
+ENDPOINT_PATH="${ENDPOINT%%[?#]*}"
+case "$ENDPOINT_PATH" in
   */messages|*/messages/) PROTOCOL="anthropic" ;;
   *)                      PROTOCOL="openai" ;;
 esac

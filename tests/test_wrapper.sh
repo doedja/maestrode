@@ -330,6 +330,21 @@ p=json.load(open('$REQ_CAP'))
 assert p.get('system')=='s' and 'stream_options' not in p
 " >/dev/null 2>&1 && ok "auto-detect produced anthropic payload" || ko "auto-detect payload wrong"
 
+echo "== test 20a: /messages auto-detect ignores query string / fragment =="
+out=$(MAESTRODE_ENDPOINT="https://x.test/v1/messages?format=openai" PATH="$SHIM_BIN:$PATH" "$MAESTRODE" --system "s" "hi" 2>/dev/null)
+[[ "$out" == "auto detected" ]] && ok "/messages?query still selects anthropic" || ko "query-string broke auto-detect: '$out'"
+
+echo "== test 20b: env-file value strips trailing inline comment =="
+ENVCFG="$TMP/cfg_comment"; mkdir -p "$ENVCFG"
+printf 'MAESTRODE_API_KEY=k\nMAESTRODE_MODEL=fixmodel # use this model\n' > "$ENVCFG/env"
+MAESTRODE_CONFIG_DIR="$ENVCFG" MAESTRODE_ENDPOINT="https://x.test/v1/messages" \
+  PATH="$SHIM_BIN:$PATH" "$MAESTRODE" "hi" >/dev/null 2>&1
+python3 -c "
+import json
+p=json.load(open('$REQ_CAP'))
+assert p.get('model')=='fixmodel', p.get('model')
+" >/dev/null 2>&1 && ok "inline comment stripped from env value" || ko "env comment not stripped: $(python3 -c "import json;print(json.load(open('$REQ_CAP')).get('model'))" 2>/dev/null)"
+
 echo "== test 21: anthropic thinking_delta routes to reasoning, content stays clean =="
 cat > "$ANTHRO_FIX" <<'JEOF'
 {"content":"final answer","thinking":"secret reasoning here","stop_reason":"end_turn","input_tokens":12,"output_tokens":5}
